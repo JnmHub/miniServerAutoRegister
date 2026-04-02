@@ -75,7 +75,7 @@ def build_cpa_base_url(port: int = 8317) -> str:
     explicit_base_url = str(os.environ.get("APP_CPA_BASE_URL", "") or "").strip()
     if explicit_base_url:
         return explicit_base_url.rstrip("/")
-    return f"http://{detect_local_ipv4()}:{int(port)}"
+    return f"http://127.0.0.1:{int(port)}"
 
 
 OPENAI_AUTH_BASE = "https://auth.openai.com"
@@ -4654,9 +4654,8 @@ class RegisterRuntime:
             else:
                 with open(staged_path, "w", encoding="utf-8") as f:
                     json.dump(token_data or {}, f, ensure_ascii=False)
-
-            # uploaded, _ = self.cpa_manager.upload(self.cpa_upload_dir, staged_name)
-            return True
+            uploaded, _ = self.cpa_manager.upload(self.cpa_upload_dir, staged_name)
+            return bool(uploaded)
         except Exception as e:
             self.logger.warning("上传 token 异常: %s", e)
             return False

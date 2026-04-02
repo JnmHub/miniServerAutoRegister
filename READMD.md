@@ -10,6 +10,7 @@
 - 如果安装 Python 时碰到 `apt/dpkg` 锁，脚本会自动等待并重试
 - 如果系统仓库或 PPA 无法提供 Python 3.10+，脚本会自动回退到 `uv` 托管安装 Python 3.12
 - 如果 GitHub 的 `codeload` 下载异常，脚本会自动回退到 GitHub 官方归档链接，必要时再回退到 `git clone`
+- 默认 CPA 地址为 `http://127.0.0.1:8317`
 - 不传业务参数时，继续使用项目当前默认值，不会主动修改默认配置
 
 ## 1. 直接启动
@@ -17,6 +18,8 @@
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/install.sh | bash
 ```
+
+systemctl restart mini-server-auto-register.service
 
 默认会：
 
@@ -218,3 +221,8 @@ python3 auto_pool_maintainer.py --help
 ```bash
 bash install.sh --source-dir . --no-run
 ```
+
+
+查看状态: systemctl status mini-server-auto-register.service
+重启服务: systemctl restart mini-server-auto-register.service
+查看日志: journalctl -u mini-server-auto-register.service -f
