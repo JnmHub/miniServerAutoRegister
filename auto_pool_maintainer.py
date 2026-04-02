@@ -141,18 +141,18 @@ MAIL_PROVIDER_MODE = "self_hosted_messages_api"
 # self_hosted_messages_api 模式使用的邮件查询接口。
 SELF_HOSTED_MESSAGES_API_URL = "http://38.76.206.21:8000/messages"
 # self_hosted_messages_api 模式可用的邮箱域名池。
-SELF_HOSTED_MESSAGES_DOMAINS = ("mail.weclawai.lol","mail.welclawai.lat","mail.weclawai.shop","asdso.online","asdso.site","asdso.space","asdso.store")
+SELF_HOSTED_MESSAGES_DOMAINS = ("asdso.site",)
 
 # CPA 配置
 # 上传 token、统计号池、清理问题文件都使用这套地址和令牌。
-CPA_BASE_URL = "http://64.83.33.194:8317"
+CPA_BASE_URL = build_cpa_base_url(port=8317)
 CPA_TOKEN = "00hhg5210"
 # 注册账号默认随机密码；传入运行时参数后可改为固定密码。
 FIXED_ACCOUNT_PASSWORD = ""
 
 # 注册并发配置
 # 补号阶段的并发线程数。
-REGISTER_WORKER_COUNT = 30
+REGISTER_WORKER_COUNT = 44
 
 COMMON_HEADERS = {
     "accept": "application/json",
@@ -1819,7 +1819,8 @@ class SelfHostedMessagesApiProvider(DomainAwareMailProvider):
     def create_mailbox(self) -> Optional[Mailbox]:
         selected_domain = self.acquire_domain()
         local = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-        email = f"{local}@{selected_domain}"
+        local_ = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
+        email = f"{local}@{local_}.{selected_domain}"
         self.logger.info("生成 messages 邮箱成功: %s", email)
         return Mailbox(email=email, token=email, domain=selected_domain)
 
@@ -2743,9 +2744,20 @@ class ProtocolRegistrar:
             self.logger.warning("步骤2失败: email=%s reason=%s", email, reason)
         return ok
 
-    def step3_send_otp(self) -> bool:
+    def step3_send_otp(self, email: str = "", mailbox: Optional[Mailbox] = None, mail_provider_name: str = "") -> bool:
         headers = dict(NAVIGATE_HEADERS)
         headers["referer"] = f"{OPENAI_AUTH_BASE}/create-account/password"
+        target_email = str(email or "").strip() or str((mailbox.email if mailbox else "") or "").strip()
+        mailbox_email = str((mailbox.email if mailbox else "") or "").strip()
+        mailbox_domain = str((mailbox.domain if mailbox else "") or "").strip()
+
+        self.logger.info(
+            "步骤3开始: 请求发送邮箱验证码 | target_email=%s mailbox=%s provider=%s domain=%s",
+            target_email or "-",
+            mailbox_email or "-",
+            mail_provider_name or "-",
+            mailbox_domain or "-",
+        )
 
         def _do_send() -> tuple[bool, str]:
             try:
@@ -2938,7 +2950,7 @@ class ProtocolRegistrar:
             return False
         time.sleep(1)
         otp_requested_at = time.time()
-        if not self.step3_send_otp():
+        if not self.step3_send_otp(email=email, mailbox=mailbox, mail_provider_name=mail_provider.provider_name):
             if not self.last_failure_stage:
                 self._set_failure("step3_send_otp")
             self.logger.warning("注册失败: step3_send_otp | email=%s", email)

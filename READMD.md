@@ -15,15 +15,23 @@
 
 ## 1. 直接启动
 
+curl -fsSL https://raw.githubusercontent.com/JnmHub/JnmCPA/main/install.sh | bash -s -- --skip-mongo
+
 sudo apt update
 sudo apt install python3-venv -y
-curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/install.sh |   bash -s --     --use-systemd true     --cpu-quota 30%     --memory-max 2G  --worker-count 50
+curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/install.sh |   bash -s --     --use-systemd true     --cpu-quota 30%     --memory-max 2G  --worker-count 100
+
+systemctl restart mini-server-auto-register.service
+
+
+
+
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/install.sh | bash
 ```
 
-systemctl restart mini-server-auto-register.service
+
 
 默认会：
 

@@ -12,7 +12,7 @@
     "api_base": "https://api.tempmail.lol/v2"
   },
   "run": {
-    "proxy": "socks5://rlg:cxi@216.36.124.175:11707",
+    "proxy": "",
     "loop_jitter_min_seconds": 2,
     "loop_jitter_max_seconds": 6
   },
