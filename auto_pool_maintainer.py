@@ -117,7 +117,7 @@ FIXED_ACCOUNT_PASSWORD = ""
 
 # 注册并发配置
 # 补号阶段的并发线程数。
-REGISTER_WORKER_COUNT = 100
+REGISTER_WORKER_COUNT = 30
 
 COMMON_HEADERS = {
     "accept": "application/json",

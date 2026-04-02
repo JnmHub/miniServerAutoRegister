@@ -35,6 +35,9 @@ Install options:
 App options:
   未识别的参数会原样透传给 auto_pool_maintainer.py。
 
+Notes:
+  安装脚本会在检测到 Python < 3.10 或缺少 venv 时自动尝试安装新版本 Python。
+
 Examples:
   curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/install.sh | bash
 
@@ -60,6 +63,158 @@ EOF
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "缺少命令: $1" >&2
+    exit 1
+  fi
+}
+
+run_as_root() {
+  if [[ "$EUID" -eq 0 ]]; then
+    "$@"
+    return
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+    return
+  fi
+  echo "需要 root 或 sudo 权限来安装系统依赖。" >&2
+  exit 1
+}
+
+python_cmd_is_compatible() {
+  local candidate="$1"
+  command -v "$candidate" >/dev/null 2>&1 || return 1
+  "$candidate" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+}
+
+python_cmd_has_venv() {
+  local candidate="$1"
+  command -v "$candidate" >/dev/null 2>&1 || return 1
+  "$candidate" -m venv -h >/dev/null 2>&1
+}
+
+pick_compatible_python() {
+  local candidate
+  local seen="|"
+  for candidate in "$PYTHON_BIN" python3.13 python3.12 python3.11 python3.10 python3 python; do
+    [[ -n "$candidate" ]] || continue
+    [[ "$seen" == *"|${candidate}|"* ]] && continue
+    seen="${seen}${candidate}|"
+    if python_cmd_is_compatible "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+apt_package_available() {
+  local package_name="$1"
+  apt-cache show "$package_name" >/dev/null 2>&1
+}
+
+is_ubuntu_system() {
+  [[ -f /etc/os-release ]] || return 1
+  . /etc/os-release
+  [[ "${ID:-}" == "ubuntu" ]]
+}
+
+ensure_deadsnakes_ppa() {
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common ca-certificates gnupg
+  if ! grep -Rhsq "deadsnakes/ppa" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
+    run_as_root add-apt-repository -y ppa:deadsnakes/ppa
+  fi
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+}
+
+install_python_with_apt() {
+  local version
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl tar
+
+  for version in 3.13 3.12 3.11 3.10; do
+    if apt_package_available "python${version}" && apt_package_available "python${version}-venv"; then
+      run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "python${version}" "python${version}-venv"
+      printf 'python%s\n' "$version"
+      return 0
+    fi
+  done
+
+  if is_ubuntu_system; then
+    ensure_deadsnakes_ppa
+    for version in 3.13 3.12 3.11 3.10; do
+      if apt_package_available "python${version}" && apt_package_available "python${version}-venv"; then
+        run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "python${version}" "python${version}-venv"
+        printf 'python%s\n' "$version"
+        return 0
+      fi
+    done
+  fi
+
+  return 1
+}
+
+install_python_with_dnf_family() {
+  local pm="$1"
+  local package_name
+  for package_name in python3.12 python3.11 python3.10; do
+    if run_as_root "$pm" install -y "$package_name" >/dev/null 2>&1; then
+      if command -v "$package_name" >/dev/null 2>&1; then
+        printf '%s\n' "$package_name"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+ensure_python_310_or_newer() {
+  local selected=""
+
+  if selected="$(pick_compatible_python 2>/dev/null)"; then
+    PYTHON_BIN="$selected"
+    if python_cmd_has_venv "$PYTHON_BIN"; then
+      return 0
+    fi
+  fi
+
+  echo "检测到 Python 不满足 3.10+ 或缺少 venv，开始自动安装..." >&2
+
+  if command -v apt-get >/dev/null 2>&1; then
+    selected="$(install_python_with_apt || true)"
+  elif command -v dnf >/dev/null 2>&1; then
+    selected="$(install_python_with_dnf_family dnf || true)"
+  elif command -v yum >/dev/null 2>&1; then
+    selected="$(install_python_with_dnf_family yum || true)"
+  fi
+
+  if [[ -z "$selected" ]]; then
+    selected="$(pick_compatible_python 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$selected" ]]; then
+    echo "自动安装 Python 失败，请手动安装 Python 3.10+ 后重试。" >&2
+    exit 1
+  fi
+
+  PYTHON_BIN="$selected"
+
+  if ! python_cmd_is_compatible "$PYTHON_BIN"; then
+    local version_text
+    version_text="$("$PYTHON_BIN" - <<'PY'
+import sys
+print(sys.version.split()[0])
+PY
+)"
+    echo "Python 版本过低: ${version_text}，需要 3.10+。" >&2
+    exit 1
+  fi
+
+  if ! python_cmd_has_venv "$PYTHON_BIN"; then
+    echo "已找到 ${PYTHON_BIN}，但缺少 venv 模块，请安装对应的 venv 包后重试。" >&2
     exit 1
   fi
 }
@@ -192,31 +347,7 @@ while (($# > 0)); do
   esac
 done
 
-require_cmd tar
-require_cmd curl
-
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  if command -v python3 >/dev/null 2>&1; then
-    PYTHON_BIN="python3"
-  elif command -v python >/dev/null 2>&1; then
-    PYTHON_BIN="python"
-  else
-    echo "未找到 Python，请先安装 Python 3.10+。" >&2
-    exit 1
-  fi
-fi
-
-"$PYTHON_BIN" - <<'PY'
-import sys
-
-if sys.version_info < (3, 10):
-    raise SystemExit(f"Python 版本过低: {sys.version.split()[0]}，需要 3.10+")
-PY
-
-if ! "$PYTHON_BIN" -m venv -h >/dev/null 2>&1; then
-  echo "当前 Python 缺少 venv 模块，请先安装 python3-venv。" >&2
-  exit 1
-fi
+ensure_python_310_or_newer
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
@@ -228,6 +359,8 @@ if [[ -n "$SOURCE_DIR_OVERRIDE" ]]; then
   SOURCE_DIR="$(cd "$SOURCE_DIR_OVERRIDE" && pwd)"
   echo "[1/7] 使用本地源码: $SOURCE_DIR"
 else
+  require_cmd curl
+  require_cmd tar
   ARCHIVE_URL="https://codeload.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/${REPO_BRANCH}"
   ARCHIVE_PATH="${TMP_DIR}/repo.tar.gz"
   echo "[1/7] 下载源码: $ARCHIVE_URL"
