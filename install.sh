@@ -119,11 +119,6 @@ pick_compatible_python() {
   return 1
 }
 
-apt_package_available() {
-  local package_name="$1"
-  apt-cache show "$package_name" >/dev/null 2>&1
-}
-
 apt_wait_for_unlock() {
   local waited=0
   local max_wait=600
@@ -212,19 +207,58 @@ ensure_deadsnakes_ppa() {
   apt_run apt-get update
 }
 
+resolve_installed_python_path() {
+  local version="$1"
+  local cmd_name="python${version}"
+
+  if command_exists_in_path "/usr/bin/${cmd_name}"; then
+    printf '/usr/bin/%s\n' "$cmd_name"
+    return 0
+  fi
+  if command_exists_in_path "$cmd_name"; then
+    printf '%s\n' "$cmd_name"
+    return 0
+  fi
+  return 1
+}
+
+apt_try_install_python_version() {
+  local version="$1"
+  local resolved=""
+
+  if apt_run apt-get install -y "python${version}" "python${version}-venv"; then
+    :
+  elif apt_run apt-get install -y "python${version}-full"; then
+    :
+  elif apt_run apt-get install -y "python${version}" "python${version}-distutils" "python${version}-venv"; then
+    :
+  else
+    return 1
+  fi
+
+  resolved="$(resolve_installed_python_path "$version" || true)"
+  if [[ -z "$resolved" ]]; then
+    return 1
+  fi
+  if ! python_cmd_is_compatible "$resolved"; then
+    return 1
+  fi
+  if ! python_cmd_has_venv "$resolved"; then
+    return 1
+  fi
+  printf '%s\n' "$resolved"
+  return 0
+}
+
 install_python_with_apt() {
   local version
+  local resolved_path=""
   apt_run apt-get update
   apt_run apt-get install -y ca-certificates curl tar
 
   for version in 3.13 3.12 3.11 3.10; do
-    if apt_package_available "python${version}" && apt_package_available "python${version}-venv"; then
-      apt_run apt-get install -y "python${version}" "python${version}-venv"
-      if command_exists_in_path "/usr/bin/python${version}"; then
-        printf '/usr/bin/python%s\n' "$version"
-      else
-        printf 'python%s\n' "$version"
-      fi
+    if resolved_path="$(apt_try_install_python_version "$version")"; then
+      printf '%s\n' "$resolved_path"
       return 0
     fi
   done
@@ -232,13 +266,8 @@ install_python_with_apt() {
   if is_ubuntu_system; then
     ensure_deadsnakes_ppa
     for version in 3.13 3.12 3.11 3.10; do
-      if apt_package_available "python${version}" && apt_package_available "python${version}-venv"; then
-        apt_run apt-get install -y "python${version}" "python${version}-venv"
-        if command_exists_in_path "/usr/bin/python${version}"; then
-          printf '/usr/bin/python%s\n' "$version"
-        else
-          printf 'python%s\n' "$version"
-        fi
+      if resolved_path="$(apt_try_install_python_version "$version")"; then
+        printf '%s\n' "$resolved_path"
         return 0
       fi
     done
