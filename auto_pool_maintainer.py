@@ -5801,6 +5801,7 @@ def apply_cli_global_overrides(args: argparse.Namespace) -> None:
     global CPA_TOKEN
     global FIXED_ACCOUNT_PASSWORD
     global MAIL_PROVIDER_MODE
+    global REGISTER_WORKER_COUNT
     global SELF_HOSTED_MESSAGES_API_URL
     global SELF_HOSTED_MESSAGES_DOMAINS
 
@@ -5815,6 +5816,10 @@ def apply_cli_global_overrides(args: argparse.Namespace) -> None:
     account_password = str(getattr(args, "account_password", "") or "").strip()
     if account_password:
         FIXED_ACCOUNT_PASSWORD = account_password
+
+    worker_count = getattr(args, "worker_count", None)
+    if worker_count is not None:
+        REGISTER_WORKER_COUNT = max(1, int(worker_count))
 
     mail_mode_raw = str(getattr(args, "mail_mode", "") or "").strip()
     if mail_mode_raw:
@@ -5873,6 +5878,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpa-base-url", "--cpa-path", dest="cpa_base_url", default="", help="CPA 接口基础地址，例如 http://127.0.0.1:8317")
     parser.add_argument("--cpa-token", "--cpa-password", dest="cpa_token", default="", help="CPA Bearer Token/密码")
     parser.add_argument("--account-password", "--password", dest="account_password", default="", help="固定注册密码；不传则继续使用随机密码")
+    parser.add_argument("--worker-count", "--threads", dest="worker_count", type=int, default=None, help="补号并发线程数；不传则使用默认值")
     parser.add_argument(
         "--mail-mode",
         default="",
@@ -5909,6 +5915,9 @@ def run_maintainer_once(args: argparse.Namespace, logger: logging.Logger, config
 
     if min_candidates < 0:
         logger.error("min_candidates 不能小于 0（当前值=%s）", min_candidates)
+        return 2
+    if args.worker_count is not None and int(args.worker_count) <= 0:
+        logger.error("worker_count 必须大于 0（当前值=%s）", args.worker_count)
         return 2
 
     if clean_enabled:
