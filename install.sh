@@ -12,6 +12,8 @@ USE_SYSTEMD=1
 CPU_QUOTA="${CPU_QUOTA:-}"
 MEMORY_MAX="${MEMORY_MAX:-}"
 SERVICE_NAME="${SERVICE_NAME:-mini-server-auto-register}"
+UV_INSTALL_FALLBACK_DIR="${UV_INSTALL_FALLBACK_DIR:-${INSTALL_ROOT}/.uv-bin}"
+UV_PYTHON_INSTALL_FALLBACK_DIR="${UV_PYTHON_INSTALL_FALLBACK_DIR:-${INSTALL_ROOT}/.uv-python}"
 
 print_usage() {
   cat <<'EOF'
@@ -37,6 +39,7 @@ App options:
 
 Notes:
   安装脚本会在检测到 Python < 3.10 或缺少 venv 时自动尝试安装新版本 Python。
+  如果系统包管理器无法提供 Python 3.10+，会回退到 uv 托管安装 Python 3.12。
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/install.sh | bash
@@ -290,6 +293,38 @@ install_python_with_dnf_family() {
   return 1
 }
 
+install_python_with_uv() {
+  local uv_bin=""
+  local resolved=""
+
+  require_cmd curl
+  mkdir -p "$UV_INSTALL_FALLBACK_DIR" "$UV_PYTHON_INSTALL_FALLBACK_DIR"
+
+  echo "系统仓库安装 Python 失败，回退到 uv 托管安装 Python 3.12..." >&2
+  curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL="$UV_INSTALL_FALLBACK_DIR" sh >&2
+
+  uv_bin="${UV_INSTALL_FALLBACK_DIR}/uv"
+  if [[ ! -x "$uv_bin" ]]; then
+    echo "uv 安装失败: 未找到 ${uv_bin}" >&2
+    return 1
+  fi
+
+  UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_FALLBACK_DIR" \
+    "$uv_bin" python install --install-dir "$UV_PYTHON_INSTALL_FALLBACK_DIR" 3.12 >&2
+
+  resolved="$(
+    UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_FALLBACK_DIR" \
+      "$uv_bin" python find 3.12
+  )"
+
+  if [[ -z "$resolved" ]]; then
+    echo "uv 已安装，但未找到已安装的 Python 3.12。" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$resolved"
+}
+
 ensure_python_310_or_newer() {
   local selected=""
 
@@ -308,6 +343,10 @@ ensure_python_310_or_newer() {
     selected="$(install_python_with_dnf_family dnf || true)"
   elif command -v yum >/dev/null 2>&1; then
     selected="$(install_python_with_dnf_family yum || true)"
+  fi
+
+  if [[ -z "$selected" ]]; then
+    selected="$(install_python_with_uv || true)"
   fi
 
   if [[ -z "$selected" ]]; then
