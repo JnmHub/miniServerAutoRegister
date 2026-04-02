@@ -7,6 +7,7 @@
 - Linux / Ubuntu 下优先使用 `systemd` 进程守护
 - 默认自动拉起服务
 - 如果系统 Python 低于 3.10，安装脚本会自动尝试安装 Python 3.10+
+- 如果安装 Python 时碰到 `apt/dpkg` 锁，脚本会自动等待并重试
 - 不传业务参数时，继续使用项目当前默认值，不会主动修改默认配置
 
 ## 1. 直接启动
@@ -183,6 +184,7 @@ sudo apt-get install -y curl tar systemd
 - `python3` 不再是必须前置条件。
 - 如果机器只有 `Python 3.8` 或者根本没装合适版本，安装脚本会自动尝试安装 `Python 3.10+` 和对应的 `venv` 包。
 - 在 Ubuntu 上，脚本会优先使用系统仓库；如果系统仓库没有合适版本，会自动尝试接入 `deadsnakes` 并安装。
+- 如果系统正在跑 `unattended-upgrades` 占用 `dpkg` 锁，脚本会自动等待锁释放后继续安装。
 
 ## 8. 运行目录
 

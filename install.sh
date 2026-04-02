@@ -80,9 +80,18 @@ run_as_root() {
   exit 1
 }
 
+command_exists_in_path() {
+  local candidate="$1"
+  if [[ "$candidate" == */* ]]; then
+    [[ -x "$candidate" ]]
+    return
+  fi
+  command -v "$candidate" >/dev/null 2>&1
+}
+
 python_cmd_is_compatible() {
   local candidate="$1"
-  command -v "$candidate" >/dev/null 2>&1 || return 1
+  command_exists_in_path "$candidate" || return 1
   "$candidate" - <<'PY' >/dev/null 2>&1
 import sys
 raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
@@ -91,7 +100,7 @@ PY
 
 python_cmd_has_venv() {
   local candidate="$1"
-  command -v "$candidate" >/dev/null 2>&1 || return 1
+  command_exists_in_path "$candidate" || return 1
   "$candidate" -m venv -h >/dev/null 2>&1
 }
 
@@ -115,6 +124,78 @@ apt_package_available() {
   apt-cache show "$package_name" >/dev/null 2>&1
 }
 
+apt_wait_for_unlock() {
+  local waited=0
+  local max_wait=600
+  local lock_paths=(
+    /var/lib/dpkg/lock-frontend
+    /var/lib/dpkg/lock
+    /var/lib/apt/lists/lock
+    /var/cache/apt/archives/lock
+  )
+
+  while :; do
+    local locked=0
+    local lock_path=""
+    for lock_path in "${lock_paths[@]}"; do
+      if command -v fuser >/dev/null 2>&1 && fuser "$lock_path" >/dev/null 2>&1; then
+        locked=1
+        break
+      fi
+    done
+
+    if [[ "$locked" -eq 0 ]]; then
+      return 0
+    fi
+
+    if (( waited == 0 )); then
+      echo "检测到 apt/dpkg 正在被其他进程占用，等待锁释放..." >&2
+    fi
+
+    if (( waited >= max_wait )); then
+      echo "等待 apt/dpkg 锁超时（>${max_wait}s），请稍后重试。" >&2
+      return 1
+    fi
+
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+
+apt_run() {
+  local output_file=""
+  local status=0
+  local attempt=0
+
+  while (( attempt < 120 )); do
+    apt_wait_for_unlock || return 1
+    output_file="$(mktemp)"
+
+    if run_as_root env DEBIAN_FRONTEND=noninteractive "$@" >"$output_file" 2>&1; then
+      cat "$output_file" >&2
+      rm -f "$output_file"
+      return 0
+    fi
+
+    status=$?
+    cat "$output_file" >&2 || true
+
+    if grep -Eqi "Could not get lock|Unable to acquire the dpkg frontend lock|Could not open lock file" "$output_file"; then
+      rm -f "$output_file"
+      attempt=$((attempt + 1))
+      echo "apt/dpkg 仍被占用，5 秒后重试..." >&2
+      sleep 5
+      continue
+    fi
+
+    rm -f "$output_file"
+    return "$status"
+  done
+
+  echo "等待 apt/dpkg 锁超时，请稍后重试。" >&2
+  return 1
+}
+
 is_ubuntu_system() {
   [[ -f /etc/os-release ]] || return 1
   . /etc/os-release
@@ -122,23 +203,28 @@ is_ubuntu_system() {
 }
 
 ensure_deadsnakes_ppa() {
-  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
-  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common ca-certificates gnupg
+  apt_run apt-get update
+  apt_run apt-get install -y software-properties-common ca-certificates gnupg
   if ! grep -Rhsq "deadsnakes/ppa" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
-    run_as_root add-apt-repository -y ppa:deadsnakes/ppa
+    apt_wait_for_unlock
+    run_as_root add-apt-repository -y ppa:deadsnakes/ppa >&2
   fi
-  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+  apt_run apt-get update
 }
 
 install_python_with_apt() {
   local version
-  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
-  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl tar
+  apt_run apt-get update
+  apt_run apt-get install -y ca-certificates curl tar
 
   for version in 3.13 3.12 3.11 3.10; do
     if apt_package_available "python${version}" && apt_package_available "python${version}-venv"; then
-      run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "python${version}" "python${version}-venv"
-      printf 'python%s\n' "$version"
+      apt_run apt-get install -y "python${version}" "python${version}-venv"
+      if command_exists_in_path "/usr/bin/python${version}"; then
+        printf '/usr/bin/python%s\n' "$version"
+      else
+        printf 'python%s\n' "$version"
+      fi
       return 0
     fi
   done
@@ -147,8 +233,12 @@ install_python_with_apt() {
     ensure_deadsnakes_ppa
     for version in 3.13 3.12 3.11 3.10; do
       if apt_package_available "python${version}" && apt_package_available "python${version}-venv"; then
-        run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "python${version}" "python${version}-venv"
-        printf 'python%s\n' "$version"
+        apt_run apt-get install -y "python${version}" "python${version}-venv"
+        if command_exists_in_path "/usr/bin/python${version}"; then
+          printf '/usr/bin/python%s\n' "$version"
+        else
+          printf 'python%s\n' "$version"
+        fi
         return 0
       fi
     done
