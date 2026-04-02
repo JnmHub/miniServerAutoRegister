@@ -40,6 +40,11 @@ try:
 except Exception:
     aiohttp = None
 
+try:
+    import socks as pysocks  # type: ignore
+except Exception:
+    pysocks = None
+
 
 def detect_local_ipv4(fallback: str = "127.0.0.1") -> str:
     try:
@@ -78,6 +83,36 @@ def build_cpa_base_url(port: int = 8317) -> str:
     return f"http://127.0.0.1:{int(port)}"
 
 
+SUPPORTED_PROXY_SCHEMES = ("http", "https", "socks5", "socks5h", "socks4", "socks4a")
+
+
+def normalize_proxy_url(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def is_socks_proxy_url(proxy_url: str) -> bool:
+    scheme = str(urlparse(str(proxy_url or "")).scheme or "").strip().lower()
+    return scheme.startswith("socks")
+
+
+def validate_proxy_url(proxy_url: str) -> str:
+    normalized = normalize_proxy_url(proxy_url)
+    if not normalized:
+        return ""
+
+    parsed = urlparse(normalized)
+    scheme = str(parsed.scheme or "").strip().lower()
+    if scheme not in SUPPORTED_PROXY_SCHEMES:
+        raise RuntimeError(
+            f"不支持的代理协议: {scheme or '(empty)'}；当前支持: {', '.join(SUPPORTED_PROXY_SCHEMES)}"
+        )
+    if not parsed.hostname:
+        raise RuntimeError(f"代理地址格式错误: {normalized}")
+    if is_socks_proxy_url(normalized) and pysocks is None:
+        raise RuntimeError("当前环境缺少 PySocks，无法使用 SOCKS 代理。请执行: pip install -r requirements.txt")
+    return normalized
+
+
 OPENAI_AUTH_BASE = "https://auth.openai.com"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -110,7 +145,7 @@ SELF_HOSTED_MESSAGES_DOMAINS = ("mail.weclawai.lol","mail.welclawai.lat","mail.w
 
 # CPA 配置
 # 上传 token、统计号池、清理问题文件都使用这套地址和令牌。
-CPA_BASE_URL = build_cpa_base_url(port=8317)
+CPA_BASE_URL = "http://64.83.33.194:8317"
 CPA_TOKEN = "00hhg5210"
 # 注册账号默认随机密码；传入运行时参数后可改为固定密码。
 FIXED_ACCOUNT_PASSWORD = ""
@@ -998,8 +1033,9 @@ def create_session(proxy: str = "") -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
-    if proxy:
-        s.proxies = {"http": proxy, "https": proxy}
+    normalized_proxy = validate_proxy_url(proxy)
+    if normalized_proxy:
+        s.proxies = {"http": normalized_proxy, "https": normalized_proxy}
     return s
 
 
@@ -5764,9 +5800,9 @@ def apply_runtime_overrides(conf: Dict[str, Any], args: argparse.Namespace) -> D
         output_cfg["token_json_dir"] = token_json_dir
         output_cfg["save_local"] = True
 
-    proxy_url = str(getattr(args, "proxy_url", "") or "").strip()
+    proxy_url = validate_proxy_url(getattr(args, "proxy_url", ""))
     use_proxy = getattr(args, "use_proxy", None)
-    existing_proxy = str(run_cfg.get("proxy") or "").strip()
+    existing_proxy = validate_proxy_url(run_cfg.get("proxy"))
     if proxy_url:
         run_cfg["proxy"] = proxy_url
     elif use_proxy is False:
@@ -5886,7 +5922,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mail-api", default="", help="邮箱接口地址；messages 模式会覆盖 SELF_HOSTED_MESSAGES_API_URL")
     parser.add_argument("--mail-domains", default="", help="邮箱域名池，多个域名用逗号分隔")
     parser.add_argument("--use-proxy", type=parse_cli_bool, default=None, help="是否使用代理：true/false；不传则使用默认值")
-    parser.add_argument("--proxy-url", "--proxy", dest="proxy_url", default="", help="代理地址，例如 http://127.0.0.1:7890")
+    parser.add_argument(
+        "--proxy-url",
+        "--proxy",
+        dest="proxy_url",
+        default="",
+        help="代理地址，例如 http://127.0.0.1:7890 或 socks5://user:pass@host:port",
+    )
     return parser.parse_args()
 
 

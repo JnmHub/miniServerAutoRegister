@@ -15,6 +15,10 @@
 
 ## 1. 直接启动
 
+sudo apt update
+sudo apt install python3-venv -y
+curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/install.sh |   bash -s --     --use-systemd true     --cpu-quota 30%     --memory-max 2G  --worker-count 50
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/install.sh | bash
 ```
@@ -52,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/
     --use-proxy true \
     --proxy-url http://127.0.0.1:7890
 ```
-
+curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/install.sh |  bash -s --  --cpu-quota 80%  --memory-max 2G  --worker-count 50
 ## 3. 新增参数说明
 
 这几个是这次新增的重点参数：
@@ -110,7 +114,7 @@ curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/
 | `--once` | 强制单次执行 |
 | `--clean-files` | 是否先清理问题文件，填 `true` 或 `false` |
 | `--use-proxy` | 是否使用代理，填 `true` 或 `false` |
-| `--proxy-url` / `--proxy` | 代理地址，例如 `http://127.0.0.1:7890` |
+| `--proxy-url` / `--proxy` | 代理地址，例如 `http://127.0.0.1:7890`、`socks5://user:pass@host:port` |
 | `--token-json-dir` | token JSON 本地保存目录 |
 | `--log-dir` | 日志目录 |
 | `--config` | 自定义配置文件路径 |
@@ -118,6 +122,8 @@ curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/
 说明：
 
 - `--use-proxy true` 时，建议同时传 `--proxy-url`。如果不传，就要求配置文件里已经有 `run.proxy`。
+- 当前支持的代理协议：`http`、`https`、`socks5`、`socks5h`、`socks4`、`socks4a`。
+- 如果你使用 SOCKS5，推荐写成 `socks5://user:pass@host:port` 或 `socks5h://user:pass@host:port`。
 - `--loop` / `--once` 和 `--loop-mode` 都能控制循环模式；如果都不传，就继续使用代码默认值。
 
 ## 5. install.sh 自己支持的参数
