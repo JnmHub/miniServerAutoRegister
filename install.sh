@@ -325,6 +325,52 @@ install_python_with_uv() {
   printf '%s\n' "$resolved"
 }
 
+download_repo_source() {
+  local archive_path="${TMP_DIR}/repo.tar.gz"
+  local extracted_dir=""
+  local download_urls=(
+    "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REPO_BRANCH}.tar.gz"
+    "https://codeload.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/${REPO_BRANCH}"
+  )
+  local url=""
+
+  require_cmd curl
+  require_cmd tar
+
+  for url in "${download_urls[@]}"; do
+    echo "[1/7] 下载源码: ${url}"
+    if curl -fL --retry 3 --retry-all-errors --connect-timeout 15 "$url" -o "$archive_path"; then
+      rm -rf "${TMP_DIR:?}/${REPO_NAME}-extract"
+      mkdir -p "${TMP_DIR}/${REPO_NAME}-extract"
+      tar -xzf "$archive_path" -C "${TMP_DIR}/${REPO_NAME}-extract"
+
+      extracted_dir=""
+      while IFS= read -r -d '' candidate; do
+        extracted_dir="$candidate"
+        break
+      done < <(find "${TMP_DIR}/${REPO_NAME}-extract" -mindepth 1 -maxdepth 1 -type d -print0)
+
+      if [[ -n "$extracted_dir" ]]; then
+        printf '%s\n' "$extracted_dir"
+        return 0
+      fi
+    fi
+    echo "下载失败，尝试下一个源码获取方式..." >&2
+  done
+
+  if command -v git >/dev/null 2>&1; then
+    extracted_dir="${TMP_DIR}/${REPO_NAME}-git"
+    echo "[1/7] 下载源码: git clone https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
+    if git clone --depth 1 --branch "$REPO_BRANCH" "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "$extracted_dir" >&2; then
+      printf '%s\n' "$extracted_dir"
+      return 0
+    fi
+  fi
+
+  echo "源码下载失败，请检查仓库地址、分支名或 GitHub 网络连通性。" >&2
+  return 1
+}
+
 ensure_python_310_or_newer() {
   local selected=""
 
@@ -517,24 +563,7 @@ if [[ -n "$SOURCE_DIR_OVERRIDE" ]]; then
   SOURCE_DIR="$(cd "$SOURCE_DIR_OVERRIDE" && pwd)"
   echo "[1/7] 使用本地源码: $SOURCE_DIR"
 else
-  require_cmd curl
-  require_cmd tar
-  ARCHIVE_URL="https://codeload.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/${REPO_BRANCH}"
-  ARCHIVE_PATH="${TMP_DIR}/repo.tar.gz"
-  echo "[1/7] 下载源码: $ARCHIVE_URL"
-  curl -fsSL "$ARCHIVE_URL" -o "$ARCHIVE_PATH"
-  tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
-
-  SOURCE_DIR=""
-  while IFS= read -r -d '' candidate; do
-    SOURCE_DIR="$candidate"
-    break
-  done < <(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d -name "${REPO_NAME}-*" -print0)
-
-  if [[ -z "$SOURCE_DIR" ]]; then
-    echo "源码下载完成，但未找到解压目录。" >&2
-    exit 1
-  fi
+  SOURCE_DIR="$(download_repo_source)"
 fi
 
 APP_DIR="${INSTALL_ROOT}/app"
