@@ -12,9 +12,6 @@ USE_SYSTEMD=1
 CPU_QUOTA="${CPU_QUOTA:-}"
 MEMORY_MAX="${MEMORY_MAX:-}"
 SERVICE_NAME="${SERVICE_NAME:-mini-server-auto-register}"
-AUTO_INSTALL_PYTHON=1
-PYTHON_VERSION="3.11.10"
-PYTHON_INSTALL_PREFIX="${PYTHON_INSTALL_PREFIX:-$HOME/.local/python/$PYTHON_VERSION}"
 
 print_usage() {
   cat <<'EOF'
@@ -33,13 +30,13 @@ Install options:
   --memory-max VALUE     systemd MemoryMax，例如 512M、1G
   --service-name NAME    systemd 服务名，默认 mini-server-auto-register
   --no-run               安装完成后不立即启动
-  --auto-install-python  自动安装 Python ${PYTHON_VERSION}（默认启用）
-  --python-version VER   指定 Python 版本，默认 ${PYTHON_VERSION}
-  --python-prefix DIR    Python 安装前缀，默认 ~/.local/python/版本号
   -h, --help             显示帮助
 
 App options:
   未识别的参数会原样透传给 auto_pool_maintainer.py。
+
+Notes:
+  安装脚本会在检测到 Python < 3.10 或缺少 venv 时自动尝试安装新版本 Python。
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/install.sh | bash
@@ -66,9 +63,160 @@ EOF
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "缺少命令: $1" >&2
-    return 1
+    exit 1
   fi
-  return 0
+}
+
+run_as_root() {
+  if [[ "$EUID" -eq 0 ]]; then
+    "$@"
+    return
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+    return
+  fi
+  echo "需要 root 或 sudo 权限来安装系统依赖。" >&2
+  exit 1
+}
+
+python_cmd_is_compatible() {
+  local candidate="$1"
+  command -v "$candidate" >/dev/null 2>&1 || return 1
+  "$candidate" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+}
+
+python_cmd_has_venv() {
+  local candidate="$1"
+  command -v "$candidate" >/dev/null 2>&1 || return 1
+  "$candidate" -m venv -h >/dev/null 2>&1
+}
+
+pick_compatible_python() {
+  local candidate
+  local seen="|"
+  for candidate in "$PYTHON_BIN" python3.13 python3.12 python3.11 python3.10 python3 python; do
+    [[ -n "$candidate" ]] || continue
+    [[ "$seen" == *"|${candidate}|"* ]] && continue
+    seen="${seen}${candidate}|"
+    if python_cmd_is_compatible "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+apt_package_available() {
+  local package_name="$1"
+  apt-cache show "$package_name" >/dev/null 2>&1
+}
+
+is_ubuntu_system() {
+  [[ -f /etc/os-release ]] || return 1
+  . /etc/os-release
+  [[ "${ID:-}" == "ubuntu" ]]
+}
+
+ensure_deadsnakes_ppa() {
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common ca-certificates gnupg
+  if ! grep -Rhsq "deadsnakes/ppa" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
+    run_as_root add-apt-repository -y ppa:deadsnakes/ppa
+  fi
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+}
+
+install_python_with_apt() {
+  local version
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl tar
+
+  for version in 3.13 3.12 3.11 3.10; do
+    if apt_package_available "python${version}" && apt_package_available "python${version}-venv"; then
+      run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "python${version}" "python${version}-venv"
+      printf 'python%s\n' "$version"
+      return 0
+    fi
+  done
+
+  if is_ubuntu_system; then
+    ensure_deadsnakes_ppa
+    for version in 3.13 3.12 3.11 3.10; do
+      if apt_package_available "python${version}" && apt_package_available "python${version}-venv"; then
+        run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "python${version}" "python${version}-venv"
+        printf 'python%s\n' "$version"
+        return 0
+      fi
+    done
+  fi
+
+  return 1
+}
+
+install_python_with_dnf_family() {
+  local pm="$1"
+  local package_name
+  for package_name in python3.12 python3.11 python3.10; do
+    if run_as_root "$pm" install -y "$package_name" >/dev/null 2>&1; then
+      if command -v "$package_name" >/dev/null 2>&1; then
+        printf '%s\n' "$package_name"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+ensure_python_310_or_newer() {
+  local selected=""
+
+  if selected="$(pick_compatible_python 2>/dev/null)"; then
+    PYTHON_BIN="$selected"
+    if python_cmd_has_venv "$PYTHON_BIN"; then
+      return 0
+    fi
+  fi
+
+  echo "检测到 Python 不满足 3.10+ 或缺少 venv，开始自动安装..." >&2
+
+  if command -v apt-get >/dev/null 2>&1; then
+    selected="$(install_python_with_apt || true)"
+  elif command -v dnf >/dev/null 2>&1; then
+    selected="$(install_python_with_dnf_family dnf || true)"
+  elif command -v yum >/dev/null 2>&1; then
+    selected="$(install_python_with_dnf_family yum || true)"
+  fi
+
+  if [[ -z "$selected" ]]; then
+    selected="$(pick_compatible_python 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$selected" ]]; then
+    echo "自动安装 Python 失败，请手动安装 Python 3.10+ 后重试。" >&2
+    exit 1
+  fi
+
+  PYTHON_BIN="$selected"
+
+  if ! python_cmd_is_compatible "$PYTHON_BIN"; then
+    local version_text
+    version_text="$("$PYTHON_BIN" - <<'PY'
+import sys
+print(sys.version.split()[0])
+PY
+)"
+    echo "Python 版本过低: ${version_text}，需要 3.10+。" >&2
+    exit 1
+  fi
+
+  if ! python_cmd_has_venv "$PYTHON_BIN"; then
+    echo "已找到 ${PYTHON_BIN}，但缺少 venv 模块，请安装对应的 venv 包后重试。" >&2
+    exit 1
+  fi
 }
 
 parse_bool_value() {
@@ -91,149 +239,6 @@ set_bool_var() {
     printf -v "$var_name" '%s' 1
   else
     printf -v "$var_name" '%s' 0
-  fi
-}
-
-check_system_deps() {
-  echo "检查系统依赖..."
-  local missing_deps=()
-
-  # 基础依赖
-  for cmd in gcc make wget tar; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-      missing_deps+=("$cmd")
-    fi
-  done
-
-  # Python 编译依赖
-  local dev_packages=""
-  if [[ "$(uname -s)" == "Linux" ]]; then
-    if command -v apt-get >/dev/null 2>&1; then
-      dev_packages="build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev"
-    elif command -v yum >/dev/null 2>&1; then
-      dev_packages="gcc make openssl-devel bzip2-devel libffi-devel readline-devel sqlite-devel tk-devel gdbm-devel xz-devel"
-    elif command -v dnf >/dev/null 2>&1; then
-      dev_packages="gcc make openssl-devel bzip2-devel libffi-devel readline-devel sqlite-devel tk-devel gdbm-devel xz-devel"
-    fi
-  fi
-
-  if [[ -n "$missing_deps" ]]; then
-    echo "缺少必要依赖: ${missing_deps[*]}"
-    echo "请先安装:"
-    if command -v apt-get >/dev/null 2>&1; then
-      echo "  sudo apt-get update"
-      echo "  sudo apt-get install -y ${missing_deps[*]} $dev_packages"
-    elif command -v yum >/dev/null 2>&1; then
-      echo "  sudo yum groupinstall -y 'Development Tools'"
-      echo "  sudo yum install -y ${missing_deps[*]} $dev_packages"
-    elif command -v dnf >/dev/null 2>&1; then
-      echo "  sudo dnf groupinstall -y 'Development Tools'"
-      echo "  sudo dnf install -y ${missing_deps[*]} $dev_packages"
-    else
-      echo "请手动安装: ${missing_deps[*]}"
-    fi
-    exit 1
-  fi
-}
-
-install_python_from_source() {
-  local version="$1"
-  local prefix="$2"
-  local source_dir="${TMP_DIR}/python-build"
-
-  echo "开始编译安装 Python ${version} 到 ${prefix}"
-
-  mkdir -p "$source_dir"
-  cd "$source_dir"
-
-  # 下载 Python 源码
-  local tarball="Python-${version}.tgz"
-  local url="https://www.python.org/ftp/python/${version}/${tarball}"
-
-  echo "下载 Python 源码: $url"
-  if ! wget -q --show-progress "$url"; then
-    echo "下载失败，尝试使用 curl..."
-    curl -fsSL "$url" -o "$tarball"
-  fi
-
-  tar -xzf "$tarball"
-  cd "Python-${version}"
-
-  # 配置编译选项
-  echo "配置编译选项..."
-  ./configure \
-    --prefix="$prefix" \
-    --enable-optimizations \
-    --enable-loadable-sqlite-extensions \
-    --enable-shared \
-    --with-ssl \
-    --with-system-expat \
-    --with-system-ffi \
-    LDFLAGS="-Wl,-rpath,$prefix/lib"
-
-  # 编译（使用多核）
-  local cpu_cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
-  echo "使用 $cpu_cores 个核心编译..."
-  make -j "$cpu_cores"
-
-  # 安装
-  echo "安装 Python..."
-  make install
-
-  # 创建符号链接
-  ln -sf "$prefix/bin/python3" "$prefix/bin/python"
-  ln -sf "$prefix/bin/pip3" "$prefix/bin/pip"
-
-  # 添加到 PATH
-  export PATH="$prefix/bin:$PATH"
-
-  echo "Python ${version} 安装完成"
-}
-
-ensure_python() {
-  # 如果已经指定了 Python 路径，直接使用
-  if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    local py_version=$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    if [[ "$py_version" == "3.11" ]] || [[ "$py_version" > "3.11" ]]; then
-      echo "使用已安装的 Python: $PYTHON_BIN (版本 $py_version)"
-      return 0
-    else
-      echo "警告: 当前 Python 版本 $py_version，需要 3.11+"
-    fi
-  fi
-
-  # 尝试自动安装 Python
-  if [[ "$AUTO_INSTALL_PYTHON" -eq 1 ]]; then
-    echo "尝试自动安装 Python ${PYTHON_VERSION}..."
-
-    # 检查是否已安装
-    if [[ -f "$PYTHON_INSTALL_PREFIX/bin/python3" ]]; then
-      echo "发现已安装的 Python ${PYTHON_VERSION}，直接使用"
-      export PATH="$PYTHON_INSTALL_PREFIX/bin:$PATH"
-      PYTHON_BIN="$PYTHON_INSTALL_PREFIX/bin/python3"
-      return 0
-    fi
-
-    # 检查系统依赖
-    check_system_deps
-
-    # 编译安装
-    install_python_from_source "$PYTHON_VERSION" "$PYTHON_INSTALL_PREFIX"
-
-    # 验证安装
-    if [[ -f "$PYTHON_INSTALL_PREFIX/bin/python3" ]]; then
-      export PATH="$PYTHON_INSTALL_PREFIX/bin:$PATH"
-      PYTHON_BIN="$PYTHON_INSTALL_PREFIX/bin/python3"
-      echo "Python 安装成功: $PYTHON_BIN"
-      return 0
-    else
-      echo "Python 自动安装失败" >&2
-      return 1
-    fi
-  else
-    echo "错误: 未找到 Python 3.11+，且自动安装已禁用" >&2
-    echo "请安装 Python 3.11+ 或使用 --auto-install-python 启用自动安装" >&2
-    return 1
   fi
 }
 
@@ -324,30 +329,6 @@ while (($# > 0)); do
       RUN_AFTER_INSTALL=0
       shift
       ;;
-    --auto-install-python)
-      set_bool_var AUTO_INSTALL_PYTHON "$2"
-      shift 2
-      ;;
-    --auto-install-python=*)
-      set_bool_var AUTO_INSTALL_PYTHON "${1#*=}"
-      shift
-      ;;
-    --python-version)
-      PYTHON_VERSION="$2"
-      shift 2
-      ;;
-    --python-version=*)
-      PYTHON_VERSION="${1#*=}"
-      shift
-      ;;
-    --python-prefix)
-      PYTHON_INSTALL_PREFIX="$2"
-      shift 2
-      ;;
-    --python-prefix=*)
-      PYTHON_INSTALL_PREFIX="${1#*=}"
-      shift
-      ;;
     -h|--help)
       print_usage
       exit 0
@@ -366,23 +347,7 @@ while (($# > 0)); do
   esac
 done
 
-# 确保 Python 可用
-if ! ensure_python; then
-  exit 1
-fi
-
-# 验证 Python 版本
-"$PYTHON_BIN" - <<PY
-import sys
-
-if sys.version_info < (3, 11):
-    raise SystemExit(f"Python 版本过低: {sys.version.split()[0]}，需要 3.11+")
-PY
-
-if ! "$PYTHON_BIN" -m venv -h >/dev/null 2>&1; then
-  echo "当前 Python 缺少 venv 模块，请先安装 python3-venv。" >&2
-  exit 1
-fi
+ensure_python_310_or_newer
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
@@ -394,6 +359,8 @@ if [[ -n "$SOURCE_DIR_OVERRIDE" ]]; then
   SOURCE_DIR="$(cd "$SOURCE_DIR_OVERRIDE" && pwd)"
   echo "[1/7] 使用本地源码: $SOURCE_DIR"
 else
+  require_cmd curl
+  require_cmd tar
   ARCHIVE_URL="https://codeload.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/${REPO_BRANCH}"
   ARCHIVE_PATH="${TMP_DIR}/repo.tar.gz"
   echo "[1/7] 下载源码: $ARCHIVE_URL"
@@ -448,7 +415,6 @@ echo "[4/7] 生成启动脚本: $RUNNER_PATH"
 {
   echo '#!/usr/bin/env bash'
   echo 'set -euo pipefail'
-  printf 'export PATH="%s/bin:$PATH"\n' "$PYTHON_INSTALL_PREFIX"
   printf 'cd %q\n' "$RUNTIME_DIR"
   printf 'exec'
   for arg in "$VENV_DIR/bin/python" "$APP_DIR/auto_pool_maintainer.py" --config "$CONFIG_PATH" --log-dir "$LOG_DIR" "${APP_ARGS[@]}"; do
@@ -464,7 +430,6 @@ echo "程序目录: $APP_DIR"
 echo "运行目录: $RUNTIME_DIR"
 echo "配置文件: $CONFIG_PATH"
 echo "启动脚本: $RUNNER_PATH"
-echo "Python 环境: $PYTHON_BIN"
 
 is_systemd_supported() {
   [[ "$(uname -s)" == "Linux" ]] && command -v systemctl >/dev/null 2>&1
@@ -538,8 +503,6 @@ configure_systemd_service() {
       echo "User=${service_user}"
       echo "Group=${service_group}"
     fi
-    # 添加 Python 路径到环境变量
-    echo "Environment=PATH=${PYTHON_INSTALL_PREFIX}/bin:${PATH}"
     if [[ -n "$CPU_QUOTA" ]]; then
       echo "CPUQuota=${CPU_QUOTA}"
     fi
