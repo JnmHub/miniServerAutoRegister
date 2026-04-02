@@ -70,6 +70,18 @@ require_cmd() {
   fi
 }
 
+curl_download_file() {
+  local url="$1"
+  local output_path="$2"
+  local curl_args=(-fL --retry 3 --connect-timeout 15)
+
+  if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+    curl_args+=(--retry-all-errors)
+  fi
+
+  curl "${curl_args[@]}" "$url" -o "$output_path"
+}
+
 run_as_root() {
   if [[ "$EUID" -eq 0 ]]; then
     "$@"
@@ -338,8 +350,8 @@ download_repo_source() {
   require_cmd tar
 
   for url in "${download_urls[@]}"; do
-    echo "[1/7] 下载源码: ${url}"
-    if curl -fL --retry 3 --retry-all-errors --connect-timeout 15 "$url" -o "$archive_path"; then
+    echo "[1/7] 下载源码: ${url}" >&2
+    if curl_download_file "$url" "$archive_path"; then
       rm -rf "${TMP_DIR:?}/${REPO_NAME}-extract"
       mkdir -p "${TMP_DIR}/${REPO_NAME}-extract"
       tar -xzf "$archive_path" -C "${TMP_DIR}/${REPO_NAME}-extract"
@@ -360,7 +372,7 @@ download_repo_source() {
 
   if command -v git >/dev/null 2>&1; then
     extracted_dir="${TMP_DIR}/${REPO_NAME}-git"
-    echo "[1/7] 下载源码: git clone https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
+    echo "[1/7] 下载源码: git clone https://github.com/${REPO_OWNER}/${REPO_NAME}.git" >&2
     if git clone --depth 1 --branch "$REPO_BRANCH" "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "$extracted_dir" >&2; then
       printf '%s\n' "$extracted_dir"
       return 0
