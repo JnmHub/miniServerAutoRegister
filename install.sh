@@ -835,6 +835,8 @@ configure_systemd_service() {
   local unit_dir=""
   local unit_target=""
   local unit_path=""
+  local service_existed=0
+  local service_action="start"
   local service_user="${SUDO_USER:-${USER:-$(id -un)}}"
   local service_group
   service_group="$(id -gn "$service_user")"
@@ -865,6 +867,10 @@ configure_systemd_service() {
     systemctl_cmd=(systemctl --user)
     unit_path="${unit_dir}/${SERVICE_NAME}.service"
     mkdir -p "$unit_dir"
+  fi
+
+  if [[ -f "$unit_path" ]]; then
+    service_existed=1
   fi
 
   if [[ "$use_root_service" -eq 1 && "$EUID" -ne 0 ]]; then
@@ -911,19 +917,31 @@ configure_systemd_service() {
     "${root_prefix[@]}" cp "$tmp_unit" "$unit_path"
     "${systemctl_cmd[@]}" daemon-reload
     if [[ "$RUN_AFTER_INSTALL" -eq 1 ]]; then
-      "${systemctl_cmd[@]}" enable --now "${SERVICE_NAME}.service"
+      "${systemctl_cmd[@]}" enable "${SERVICE_NAME}.service"
+      if [[ "$service_existed" -eq 1 ]]; then
+        service_action="restart"
+        "${systemctl_cmd[@]}" restart "${SERVICE_NAME}.service"
+      else
+        "${systemctl_cmd[@]}" start "${SERVICE_NAME}.service"
+      fi
     fi
   else
     cp "$tmp_unit" "$unit_path"
     "${systemctl_cmd[@]}" daemon-reload
     if [[ "$RUN_AFTER_INSTALL" -eq 1 ]]; then
-      "${systemctl_cmd[@]}" enable --now "${SERVICE_NAME}.service"
+      "${systemctl_cmd[@]}" enable "${SERVICE_NAME}.service"
+      if [[ "$service_existed" -eq 1 ]]; then
+        service_action="restart"
+        "${systemctl_cmd[@]}" restart "${SERVICE_NAME}.service"
+      else
+        "${systemctl_cmd[@]}" start "${SERVICE_NAME}.service"
+      fi
     fi
   fi
 
   echo "[6/7] 已写入 systemd 服务: ${unit_path}"
   if [[ "$RUN_AFTER_INSTALL" -eq 1 ]]; then
-    echo "[7/7] 已通过 systemd 启动: ${SERVICE_NAME}.service"
+    echo "[7/7] 已通过 systemd ${service_action}: ${SERVICE_NAME}.service"
   else
     echo "[7/7] 已跳过启动（--no-run），可稍后手动启动: ${SERVICE_NAME}.service"
   fi

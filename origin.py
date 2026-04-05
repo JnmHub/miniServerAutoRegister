@@ -15,6 +15,7 @@ import threading
 import argparse
 import subprocess
 import shutil
+import builtins as _builtins
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +31,83 @@ from curl_cffi import requests
 DEFAULT_CPA_BASE_URL = "http://127.0.0.1:8317"
 DEFAULT_CPA_TOKEN = "00hhg5210"
 AUTO_WORKERS_PER_HCPU = 44
+_RAW_PRINT = _builtins.print
+_VERBOSE_LOGS = str(os.environ.get("ORIGIN_VERBOSE_LOGS", "")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _set_verbose_logs(enabled: bool) -> None:
+    global _VERBOSE_LOGS
+    _VERBOSE_LOGS = bool(enabled)
+
+
+def _should_emit_log_line(text: str) -> bool:
+    if _VERBOSE_LOGS:
+        return True
+
+    stripped = str(text or "").strip()
+    if not stripped:
+        return True
+
+    if re.fullmatch(r"\.+", stripped):
+        return False
+
+    if stripped.startswith("[*] target tokens reached"):
+        return True
+    if ">>> worker " in stripped and " start <<<" in stripped:
+        return False
+
+    noisy_prefixes = (
+        "[*] ",
+        "[Retry] ",
+        "[Run] ",
+        "[Net] ",
+        "[Blacklist] ",
+        "[Quarantine] ",
+        "[SentinelSuspect] ",
+        "[NoBlacklist] ",
+        ">>> worker ",
+        "[-] worker ",
+    )
+    if stripped.startswith(noisy_prefixes):
+        return False
+
+    if stripped.startswith("[Sub2Api] 推送成功"):
+        return False
+    if stripped.startswith("[V2RayN] probe "):
+        return False
+
+    noisy_markers = (
+        "正在等待邮箱 ",
+        "抓到啦! 验证码",
+        "收到 OpenAI 邮件但未提取到链接/验证码",
+        "找到验证链接!",
+        "找到验证码:",
+    )
+    if any(marker in stripped for marker in noisy_markers):
+        return False
+
+    noisy_exact = {
+        "超时",
+        "超时，未收到验证码",
+        "alpha-infini 暂未实现验证码轮询",
+    }
+    if stripped in noisy_exact or stripped.startswith("超时"):
+        return False
+
+    return True
+
+
+def print(*args: Any, **kwargs: Any) -> None:
+    sep = kwargs.get("sep", " ")
+    text = sep.join(str(arg) for arg in args)
+    if not _should_emit_log_line(text):
+        return
+    _RAW_PRINT(*args, **kwargs)
 
 
 def _read_first_env_value(*names: str, default: str = "") -> str:
@@ -7708,6 +7786,11 @@ def main() -> None:
         help=f"按可用 CPU 自动计算线程数（{AUTO_WORKERS_PER_HCPU} threads / hcpu）",
     )
     parser.add_argument(
+        "--verbose-logs",
+        action="store_true",
+        help="打印完整详细日志；默认使用精简日志模式",
+    )
+    parser.add_argument(
         "--mailbox-limit", type=int, default=0,
         help="邮箱申请阶段并发上限，0 表示不限制",
     )
@@ -7820,6 +7903,7 @@ def main() -> None:
         help="compatibility alias for the default low/original mode",
     )
     args = parser.parse_args()
+    _set_verbose_logs(args.verbose_logs)
     cpa_base_url, cpa_token = _resolve_cpa_settings(args.cpa_base_url, args.cpa_token)
     manage = ZeaburAuthFileManager(cpa_base_url, cpa_token)
     proxy_arg_supplied = any(
@@ -7902,6 +7986,47 @@ def main() -> None:
     _stop_event = threading.Event()
     _success_count = 0
     _success_count_lock = threading.Lock()
+    _flow_total_count = 0
+    _flow_success_count = 0
+    _flow_failed_count = 0
+    _flow_stats_lock = threading.Lock()
+
+    def _update_flow_stats(status: str) -> Tuple[int, int, int]:
+        nonlocal _flow_total_count, _flow_success_count, _flow_failed_count
+        with _flow_stats_lock:
+            if status == "success":
+                _flow_total_count += 1
+                _flow_success_count += 1
+            elif status != "stopped":
+                _flow_total_count += 1
+                _flow_failed_count += 1
+            return _flow_total_count, _flow_success_count, _flow_failed_count
+
+    def _emit_flow_summary(
+        worker_slot: int,
+        run_id: str,
+        status: str,
+        reason: str,
+        elapsed_seconds: float,
+        error: str = "",
+    ) -> None:
+        total_runs, success_runs, failed_runs = _update_flow_stats(status)
+        status_label = "SUCCESS" if status == "success" else ("STOPPED" if status == "stopped" else "FAILED")
+        with _print_lock:
+            _RAW_PRINT("")
+            _RAW_PRINT("=" * 78)
+            _RAW_PRINT(
+                f"[FLOW {status_label}] worker={worker_slot} run={run_id} elapsed={elapsed_seconds:.1f}s"
+            )
+            _RAW_PRINT(f"[FLOW REASON] {reason or 'n/a'}")
+            if error and status != "success":
+                _RAW_PRINT(f"[FLOW ERROR] {error}")
+            _RAW_PRINT(
+                f"[FLOW STATS] success={success_runs} failed={failed_runs} total={total_runs}"
+            )
+            if target_tokens > 0:
+                _RAW_PRINT(f"[FLOW TARGET] {success_runs}/{target_tokens}")
+            _RAW_PRINT("=" * 78)
 
     def _save_and_push(token_json: str) -> bool:
         nonlocal _success_count
@@ -7952,6 +8077,7 @@ def main() -> None:
         final_reason = "no_token"
         final_error = ""
         token_saved = False
+        run_started_at = time.monotonic()
         try:
             with _print_lock:
                 print(
@@ -8014,6 +8140,14 @@ def main() -> None:
                 status=final_status,
                 reason=final_reason,
                 token_saved=token_saved,
+                error=final_error,
+            )
+            _emit_flow_summary(
+                worker_slot=worker_slot,
+                run_id=run_id,
+                status=final_status,
+                reason=final_reason,
+                elapsed_seconds=time.monotonic() - run_started_at,
                 error=final_error,
             )
             _clear_run_context()
