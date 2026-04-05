@@ -31,6 +31,7 @@ from curl_cffi import requests
 DEFAULT_CPA_BASE_URL = "http://127.0.0.1:8317"
 DEFAULT_CPA_TOKEN = "00hhg5210"
 AUTO_WORKERS_PER_HCPU = 44
+MIN_NODE_MAJOR = 18
 _RAW_PRINT = _builtins.print
 _VERBOSE_LOGS = str(os.environ.get("ORIGIN_VERBOSE_LOGS", "")).strip().lower() in {
     "1",
@@ -152,11 +153,42 @@ def _configure_stdio() -> None:
 _configure_stdio()
 
 
+_warned_node_binaries = set()
+
+
+def _node_major_version(executable: str) -> int:
+    try:
+        result = subprocess.run(
+            [executable, "-v"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+        raw = str(result.stdout or result.stderr or "").strip()
+        match = re.match(r"^v(\d+)", raw)
+        if match:
+            return int(match.group(1))
+    except Exception:
+        pass
+    return 0
+
+
 def _find_node_executable() -> str:
     for candidate in ("node", "nodejs"):
         resolved = shutil.which(candidate)
         if resolved:
-            return resolved
+            major = _node_major_version(resolved)
+            if major >= MIN_NODE_MAJOR:
+                return resolved
+            if resolved not in _warned_node_binaries:
+                _warned_node_binaries.add(resolved)
+                print(
+                    f"[Warn] Node.js version too low: {resolved} "
+                    f"(detected v{major or 'unknown'}, require >= {MIN_NODE_MAJOR})"
+                )
     return ""
 
 

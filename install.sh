@@ -14,6 +14,8 @@ MEMORY_MAX="${MEMORY_MAX:-}"
 SERVICE_NAME="${SERVICE_NAME:-mini-server-auto-register}"
 UV_INSTALL_FALLBACK_DIR="${UV_INSTALL_FALLBACK_DIR:-${INSTALL_ROOT}/.uv-bin}"
 UV_PYTHON_INSTALL_FALLBACK_DIR="${UV_PYTHON_INSTALL_FALLBACK_DIR:-${INSTALL_ROOT}/.uv-python}"
+NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-18}"
+NODE_INSTALL_MAJOR="${NODE_INSTALL_MAJOR:-20}"
 APP_ENTRY_NAME=""
 IGNORED_APP_OPTIONS=()
 
@@ -50,7 +52,7 @@ App options:
     --use-proxy false           => --proxy direct
 
 Notes:
-  安装脚本会在检测到 Node.js 缺失时自动尝试安装 nodejs。
+  安装脚本会在检测到 Node.js 缺失或版本低于 18 时自动尝试安装/升级 nodejs。
   检测到 Python 或 venv 缺失时，会先尝试执行 sudo apt install python3-venv -y。
   安装脚本会在检测到 Python < 3.10 或缺少 venv 时自动尝试安装新版本 Python。
   如果系统包管理器无法提供 Python 3.10+，会回退到 uv 托管安装 Python 3.12。
@@ -132,6 +134,25 @@ node_cmd_exists() {
   command -v node >/dev/null 2>&1 || command -v nodejs >/dev/null 2>&1
 }
 
+node_cmd_major_version() {
+  local candidate="$1"
+  local version_text=""
+  local major=""
+  command_exists_in_path "$candidate" || return 1
+  version_text="$("$candidate" -v 2>/dev/null || true)"
+  major="$(printf '%s' "$version_text" | sed -E 's/^v([0-9]+).*/\1/')"
+  [[ "$major" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$major"
+}
+
+node_cmd_is_compatible() {
+  local candidate="$1"
+  local major=""
+  major="$(node_cmd_major_version "$candidate" || true)"
+  [[ -n "$major" ]] || return 1
+  [[ "$major" -ge "$NODE_MIN_MAJOR" ]]
+}
+
 resolve_node_command() {
   if command -v node >/dev/null 2>&1; then
     command -v node
@@ -141,6 +162,17 @@ resolve_node_command() {
     command -v nodejs
     return 0
   fi
+  return 1
+}
+
+resolve_compatible_node_command() {
+  local candidate=""
+  for candidate in node nodejs; do
+    if node_cmd_is_compatible "$candidate"; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -391,10 +423,27 @@ ensure_python_baseline_with_apt() {
 }
 
 install_nodejs_with_apt() {
-  apt_run apt-get update
-  if apt_run apt-get install -y nodejs npm; then
-    return 0
+  local key_tmp=""
+  local list_tmp=""
+  local target_major="$NODE_INSTALL_MAJOR"
+
+  if [[ "$target_major" -lt "$NODE_MIN_MAJOR" ]]; then
+    target_major="$NODE_MIN_MAJOR"
   fi
+
+  apt_run apt-get update
+  apt_run apt-get install -y ca-certificates curl gnupg
+
+  key_tmp="$(mktemp)"
+  list_tmp="$(mktemp)"
+  curl_download_file "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key" "$key_tmp"
+  run_as_root mkdir -p /etc/apt/keyrings
+  run_as_root gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg "$key_tmp"
+  printf 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_%s.x nodistro main\n' "$target_major" > "$list_tmp"
+  run_as_root cp "$list_tmp" /etc/apt/sources.list.d/nodesource.list
+  rm -f "$key_tmp" "$list_tmp"
+
+  apt_run apt-get update
   apt_run apt-get install -y nodejs
 }
 
@@ -405,12 +454,22 @@ install_nodejs_with_dnf_family() {
 
 ensure_nodejs_available() {
   local resolved=""
+  local existing=""
+  local existing_major=""
 
-  if node_cmd_exists; then
+  resolved="$(resolve_compatible_node_command || true)"
+  if [[ -n "$resolved" ]]; then
+    echo "Node.js 已就绪: ${resolved} ($( "$resolved" -v 2>/dev/null || true ))" >&2
     return 0
   fi
 
-  echo "检测到 Node.js 缺失，开始自动安装..." >&2
+  existing="$(resolve_node_command || true)"
+  if [[ -n "$existing" ]]; then
+    existing_major="$(node_cmd_major_version "$existing" || true)"
+    echo "检测到 Node.js 版本过低: ${existing} ($( "$existing" -v 2>/dev/null || true )); 需要 >= ${NODE_MIN_MAJOR}，开始自动升级..." >&2
+  else
+    echo "检测到 Node.js 缺失，开始自动安装..." >&2
+  fi
 
   if command -v apt-get >/dev/null 2>&1; then
     install_nodejs_with_apt || true
@@ -420,13 +479,16 @@ ensure_nodejs_available() {
     install_nodejs_with_dnf_family yum || true
   fi
 
-  resolved="$(resolve_node_command || true)"
+  resolved="$(resolve_compatible_node_command || true)"
   if [[ -n "$resolved" ]]; then
-    echo "Node.js 已就绪: ${resolved}" >&2
+    echo "Node.js 已就绪: ${resolved} ($( "$resolved" -v 2>/dev/null || true ))" >&2
     return 0
   fi
 
-  echo "自动安装 Node.js 失败，请手动安装 nodejs 后重试。" >&2
+  if [[ -n "$existing_major" ]]; then
+    echo "自动安装后 Node.js 仍低于要求版本（当前主版本: ${existing_major}，要求: >= ${NODE_MIN_MAJOR}）。" >&2
+  fi
+  echo "自动安装 Node.js 失败，请手动安装 Node.js ${NODE_MIN_MAJOR}+ 后重试。" >&2
   exit 1
 }
 
