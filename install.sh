@@ -14,6 +14,8 @@ MEMORY_MAX="${MEMORY_MAX:-}"
 SERVICE_NAME="${SERVICE_NAME:-mini-server-auto-register}"
 UV_INSTALL_FALLBACK_DIR="${UV_INSTALL_FALLBACK_DIR:-${INSTALL_ROOT}/.uv-bin}"
 UV_PYTHON_INSTALL_FALLBACK_DIR="${UV_PYTHON_INSTALL_FALLBACK_DIR:-${INSTALL_ROOT}/.uv-python}"
+APP_ENTRY_NAME=""
+IGNORED_APP_OPTIONS=()
 
 print_usage() {
   cat <<'EOF'
@@ -35,7 +37,14 @@ Install options:
   -h, --help             显示帮助
 
 App options:
-  未识别的参数会原样透传给 auto_pool_maintainer.py。
+  未识别的参数会原样透传给当前 Python 主程序。
+  兼容旧参数名：
+    --worker-count / --threads  => --workers
+    --proxy-url                 => --proxy
+    --cpa-path                  => --cpa-base-url
+    --cpa-password              => --cpa-token
+    --loop-mode false           => --once
+    --use-proxy false           => --proxy direct
 
 Notes:
   安装脚本会在检测到 Python < 3.10 或缺少 venv 时自动尝试安装新版本 Python。
@@ -48,18 +57,13 @@ Examples:
     bash -s -- \
       --cpu-quota 80% \
       --memory-max 1G \
-      --worker-count 50 \
+      --workers 50 \
       --cpa-base-url http://127.0.0.1:8317 \
       --cpa-token your-token \
-      --account-password 'Passw0rd!' \
-      --mail-mode self_hosted_messages_api \
-      --mail-api http://127.0.0.1:8000/messages \
-      --mail-domains a.com,b.com \
-      --min-candidates 3000 \
-      --loop-mode true \
-      --clean-files false \
-      --use-proxy true \
-      --proxy-url http://127.0.0.1:7890
+      --proxy http://127.0.0.1:7890 \
+      --target-tokens 100 \
+      --run-retries 2 \
+      --once
 EOF
 }
 
@@ -458,6 +462,21 @@ set_bool_var() {
   fi
 }
 
+remember_ignored_app_option() {
+  local option_name="$1"
+  IGNORED_APP_OPTIONS+=("$option_name")
+}
+
+print_ignored_app_option_warnings() {
+  local seen="|"
+  local option_name=""
+  for option_name in "${IGNORED_APP_OPTIONS[@]}"; do
+    [[ "$seen" == *"|${option_name}|"* ]] && continue
+    seen="${seen}${option_name}|"
+    echo "提示: 当前 origin.py 不支持参数 ${option_name}，安装脚本已忽略。" >&2
+  done
+}
+
 APP_ARGS=()
 while (($# > 0)); do
   case "$1" in
@@ -545,6 +564,73 @@ while (($# > 0)); do
       RUN_AFTER_INSTALL=0
       shift
       ;;
+    --worker-count|--threads)
+      APP_ARGS+=("--workers" "$2")
+      shift 2
+      ;;
+    --worker-count=*|--threads=*)
+      APP_ARGS+=("--workers" "${1#*=}")
+      shift
+      ;;
+    --proxy-url)
+      APP_ARGS+=("--proxy" "$2")
+      shift 2
+      ;;
+    --proxy-url=*)
+      APP_ARGS+=("--proxy" "${1#*=}")
+      shift
+      ;;
+    --cpa-path)
+      APP_ARGS+=("--cpa-base-url" "$2")
+      shift 2
+      ;;
+    --cpa-path=*)
+      APP_ARGS+=("--cpa-base-url" "${1#*=}")
+      shift
+      ;;
+    --cpa-password)
+      APP_ARGS+=("--cpa-token" "$2")
+      shift 2
+      ;;
+    --cpa-password=*)
+      APP_ARGS+=("--cpa-token" "${1#*=}")
+      shift
+      ;;
+    --loop)
+      shift
+      ;;
+    --loop-mode)
+      if ! parse_bool_value "$2"; then
+        APP_ARGS+=("--once")
+      fi
+      shift 2
+      ;;
+    --loop-mode=*)
+      if ! parse_bool_value "${1#*=}"; then
+        APP_ARGS+=("--once")
+      fi
+      shift
+      ;;
+    --use-proxy)
+      if ! parse_bool_value "$2"; then
+        APP_ARGS+=("--proxy" "direct")
+      fi
+      shift 2
+      ;;
+    --use-proxy=*)
+      if ! parse_bool_value "${1#*=}"; then
+        APP_ARGS+=("--proxy" "direct")
+      fi
+      shift
+      ;;
+    --account-password|--password|--mail-mode|--mail-api|--mail-domains|--min-candidates|--clean-files|--token-json-dir|--config|--log-dir)
+      remember_ignored_app_option "$1"
+      shift 2
+      ;;
+    --account-password=*|--password=*|--mail-mode=*|--mail-api=*|--mail-domains=*|--min-candidates=*|--clean-files=*|--token-json-dir=*|--config=*|--log-dir=*)
+      remember_ignored_app_option "${1%%=*}"
+      shift
+      ;;
     -h|--help)
       print_usage
       exit 0
@@ -562,6 +648,8 @@ while (($# > 0)); do
       ;;
   esac
 done
+
+print_ignored_app_option_warnings
 
 ensure_python_310_or_newer
 
@@ -589,8 +677,12 @@ mkdir -p "$INSTALL_ROOT" "$RUNTIME_DIR" "$LOG_DIR"
 rm -rf "$APP_DIR"
 cp -R "$SOURCE_DIR" "$APP_DIR"
 
-if [[ ! -f "$APP_DIR/auto_pool_maintainer.py" ]]; then
-  echo "源码目录缺少 auto_pool_maintainer.py: $APP_DIR" >&2
+if [[ -f "$APP_DIR/origin.py" ]]; then
+  APP_ENTRY_NAME="origin.py"
+elif [[ -f "$APP_DIR/auto_pool_maintainer.py" ]]; then
+  APP_ENTRY_NAME="auto_pool_maintainer.py"
+else
+  echo "源码目录缺少可执行主程序（origin.py / auto_pool_maintainer.py）: $APP_DIR" >&2
   exit 1
 fi
 
@@ -601,6 +693,12 @@ fi
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
   cp "$APP_DIR/config.json" "$CONFIG_PATH"
+fi
+
+APP_ENTRY_PATH="$APP_DIR/$APP_ENTRY_NAME"
+APP_BOOTSTRAP_ARGS=()
+if [[ "$APP_ENTRY_NAME" == "auto_pool_maintainer.py" ]]; then
+  APP_BOOTSTRAP_ARGS+=(--config "$CONFIG_PATH" --log-dir "$LOG_DIR")
 fi
 
 echo "[2/7] 创建虚拟环境: $VENV_DIR"
@@ -616,7 +714,7 @@ echo "[4/7] 生成启动脚本: $RUNNER_PATH"
   echo 'set -euo pipefail'
   printf 'cd %q\n' "$RUNTIME_DIR"
   printf 'exec'
-  for arg in "$VENV_DIR/bin/python" "$APP_DIR/auto_pool_maintainer.py" --config "$CONFIG_PATH" --log-dir "$LOG_DIR" "${APP_ARGS[@]}"; do
+  for arg in "$VENV_DIR/bin/python" "$APP_ENTRY_PATH" "${APP_BOOTSTRAP_ARGS[@]}" "${APP_ARGS[@]}"; do
     printf ' %q' "$arg"
   done
   printf '\n'
@@ -626,6 +724,7 @@ chmod +x "$RUNNER_PATH"
 echo "[5/7] 安装完成"
 echo "安装目录: $INSTALL_ROOT"
 echo "程序目录: $APP_DIR"
+echo "主程序入口: $APP_ENTRY_PATH"
 echo "运行目录: $RUNTIME_DIR"
 echo "配置文件: $CONFIG_PATH"
 echo "启动脚本: $RUNNER_PATH"

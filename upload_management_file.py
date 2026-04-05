@@ -34,21 +34,12 @@ class ZeaburAuthFileManager:
         success = response.status_code == 200 and data.get("status") == "ok"
 
         if success:
-            print(f"✈️ 上传成功：{file_name}")
+            print(f"✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈v上传成功：{file_name}")
         else:
-            print(f"❌ 上传失败：{file_name}")
+            print(f"上传失败：{file_name}")
         file_path.unlink(missing_ok=True)
         return success, data
-    # def _ban_file(self, file_name: str):
-    #     url = f"{self.base_url}/v0/management/auth-files/status"
-    #     data = {"disabled": True,"name": file_name}
-    #     response = self.session.post(url, json=data)
-    #     data = self._handle_response(response)
-    #     if response.status_code == 200 and data.get("status") == "ok":
-    #         print(f"✅ 禁用成功：{file_name}")
-    #     else:
-    #         print(f"❌ 禁用失败：{file_name}")
-    # ================= 删除 =================
+
     def delete(self, file_name: str):
         url = f"{self.base_url}/v0/management/auth-files"
         response = self.session.delete(url, params={"name": file_name})
