@@ -444,6 +444,14 @@ install_nodejs_with_apt() {
   rm -f "$key_tmp" "$list_tmp"
 
   apt_run apt-get update
+  if apt_run apt-get install -y nodejs; then
+    return 0
+  fi
+
+  echo "Node.js 安装遇到旧版 Ubuntu/Debian Node 包冲突，清理旧包后重试..." >&2
+  apt_run apt-get remove -y nodejs npm libnode-dev libnode72 nodejs-doc || true
+  apt_run apt-get autoremove -y || true
+  apt_run apt-get install -f -y || true
   apt_run apt-get install -y nodejs
 }
 
