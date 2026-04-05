@@ -14,6 +14,7 @@ import tempfile
 import threading
 import argparse
 import subprocess
+import shutil
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,6 +29,7 @@ from curl_cffi import requests
 
 DEFAULT_CPA_BASE_URL = "http://127.0.0.1:8317"
 DEFAULT_CPA_TOKEN = "00hhg5210"
+AUTO_WORKERS_PER_HCPU = 44
 
 
 def _read_first_env_value(*names: str, default: str = "") -> str:
@@ -70,6 +72,69 @@ def _configure_stdio() -> None:
 
 
 _configure_stdio()
+
+
+def _find_node_executable() -> str:
+    for candidate in ("node", "nodejs"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return ""
+
+
+def _read_text_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _detect_cgroup_cpu_limit() -> Optional[float]:
+    cpu_max_text = _read_text_file("/sys/fs/cgroup/cpu.max")
+    if cpu_max_text:
+        parts = cpu_max_text.split()
+        if len(parts) >= 2 and parts[0] != "max":
+            try:
+                quota = float(parts[0])
+                period = float(parts[1])
+                if quota > 0 and period > 0:
+                    return quota / period
+            except Exception:
+                pass
+
+    quota_text = _read_text_file("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+    period_text = _read_text_file("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    if quota_text and period_text:
+        try:
+            quota = float(quota_text)
+            period = float(period_text)
+            if quota > 0 and period > 0:
+                return quota / period
+        except Exception:
+            pass
+    return None
+
+
+def _detect_effective_cpu_count() -> float:
+    logical = float(os.cpu_count() or 1)
+    affinity_count = 0.0
+    try:
+        affinity_count = float(len(os.sched_getaffinity(0)))
+    except Exception:
+        affinity_count = 0.0
+
+    effective = affinity_count if affinity_count > 0 else logical
+    cgroup_limit = _detect_cgroup_cpu_limit()
+    if cgroup_limit and cgroup_limit > 0:
+        effective = min(effective, cgroup_limit)
+    return max(0.1, effective)
+
+
+def _compute_auto_workers() -> Tuple[int, float]:
+    cpu_units = _detect_effective_cpu_count()
+    workers = max(1, int(math.floor(cpu_units * AUTO_WORKERS_PER_HCPU + 0.5)))
+    return workers, cpu_units
 
 
 class RetryNewEmail(RuntimeError):
@@ -623,9 +688,13 @@ def _fetch_sentinel_sdk_token(
     user_agent: str,
     proxy_url: str = "",
 ) -> str:
+    node_cmd = _find_node_executable()
     if not _browser_mode:
         return ""
     if flow not in _SENTINEL_SDK_SUPPORTED_FLOWS:
+        return ""
+    if not node_cmd:
+        print("[Warn] sentinel sdk token bridge skipped: node/nodejs not found")
         return ""
     browser_path = _find_sentinel_browser_executable()
     if not browser_path:
@@ -686,7 +755,7 @@ const userAgent = process.argv[4];
     try:
         result = subprocess.run(
             [
-                "node",
+                node_cmd,
                 "-e",
                 node_script,
                 browser_path,
@@ -716,6 +785,7 @@ const userAgent = process.argv[4];
 
 
 def _fetch_sentinel_requirements_token() -> str:
+    node_cmd = _find_node_executable()
     now = time.time()
     with _sentinel_requirements_cache_lock:
         token = str(_sentinel_requirements_cache.get("token") or "").strip()
@@ -724,11 +794,11 @@ def _fetch_sentinel_requirements_token() -> str:
             return token
 
     probe_path = os.path.join(SCRIPT_DIR, "sentinel_node_vm_probe.js")
-    if not os.path.exists(probe_path):
+    if not node_cmd or not os.path.exists(probe_path):
         return ""
     try:
         result = subprocess.run(
-            ["node", probe_path, "requirements"],
+            [node_cmd, probe_path, "requirements"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -770,8 +840,9 @@ def _transform_turnstile_material(
     req_proof: str,
     req_json: Dict[str, Any],
 ) -> Dict[str, str]:
+    node_cmd = _find_node_executable()
     probe_path = os.path.join(SCRIPT_DIR, "sentinel_node_vm_probe.js")
-    if not os.path.exists(probe_path):
+    if not node_cmd or not os.path.exists(probe_path):
         return {}
 
     temp_path = ""
@@ -795,7 +866,7 @@ def _transform_turnstile_material(
             temp_path = f.name
 
         result = subprocess.run(
-            ["node", probe_path, "transform", temp_path],
+            [node_cmd, probe_path, "transform", temp_path],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -6324,6 +6395,8 @@ def _pick_experiment2_domain(domains: List[str]) -> str:
 
 
 def _prepare_v2rayn_proxy(proxy: Optional[str]) -> Optional[str]:
+    raw_proxy = "" if proxy is None else str(proxy).strip()
+    auto_mode = not raw_proxy or raw_proxy.lower() == "auto"
     candidates = _candidate_proxy_urls(proxy)
     if not candidates:
         print("[V2RayN] proxy disabled; using direct connection")
@@ -6347,6 +6420,10 @@ def _prepare_v2rayn_proxy(proxy: Optional[str]) -> Optional[str]:
     if first_success:
         print("[V2RayN] 10808 is reachable but exit loc is still CN/HK; switch node in v2rayN")
         return first_success
+
+    if auto_mode:
+        print("[V2RayN] auto scan found no reachable local proxy; using direct connection")
+        return None
 
     fallback = _normalize_proxy_url(proxy)
     if fallback:
@@ -7613,8 +7690,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--proxy",
-        default=DEFAULT_V2RAYN_PROXY,
-        help="代理地址；默认自动探测 clash 的 127.0.0.1:7897，传 direct/off 可关闭",
+        default="",
+        help="代理地址；未传时自动探测本地 127.0.0.1 候选端口，传 direct/off 可关闭",
     )
     parser.add_argument("--once", action="store_true", help="只运行一次")
     parser.add_argument("--sleep-min", type=int, default=5, help="循环模式最短等待秒数")
@@ -7623,7 +7700,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--workers", type=int, default=50,
-        help="并发线程数（默认 1，串行；>1 时并发注册）"
+        help="并发线程数；默认 50，传 1 为串行",
+    )
+    parser.add_argument(
+        "--auto-workers",
+        action="store_true",
+        help=f"按可用 CPU 自动计算线程数（{AUTO_WORKERS_PER_HCPU} threads / hcpu）",
     )
     parser.add_argument(
         "--mailbox-limit", type=int, default=0,
@@ -7740,13 +7822,26 @@ def main() -> None:
     args = parser.parse_args()
     cpa_base_url, cpa_token = _resolve_cpa_settings(args.cpa_base_url, args.cpa_token)
     manage = ZeaburAuthFileManager(cpa_base_url, cpa_token)
-    if "--proxy" not in sys.argv and sys.stdin and sys.stdin.isatty():
-        args.proxy = _prompt_proxy_value("auto")
+    proxy_arg_supplied = any(
+        arg == "--proxy" or arg.startswith("--proxy=")
+        for arg in sys.argv[1:]
+    )
+    if not proxy_arg_supplied:
+        args.proxy = "auto"
     args.proxy = _prepare_v2rayn_proxy(args.proxy)
 
     sleep_min = max(1, args.sleep_min)
     sleep_max = max(sleep_min, args.sleep_max)
-    workers = max(1, args.workers)
+    auto_worker_cpu = None
+    if args.auto_workers:
+        workers, auto_worker_cpu = _compute_auto_workers()
+        if args.workers != 50:
+            print(
+                f"[Warn] --auto-workers overrides --workers={args.workers}; "
+                f"using workers={workers}"
+            )
+    else:
+        workers = max(1, args.workers)
     _worker_count_hint = workers
     run_retries = max(0, args.run_retries)
     target_tokens = max(0, args.target_tokens)
@@ -7948,6 +8043,14 @@ def main() -> None:
 
     print(f"[Build] {SCRIPT_BUILD}")
     print(f"[Info] Yasal's Seamless OpenAI Auto-Registrar Started for ZJH (workers={workers})")
+    if auto_worker_cpu is not None:
+        print(
+            f"[Info] workers mode: auto "
+            f"(effective_cpu={auto_worker_cpu:.2f}, "
+            f"threads_per_hcpu={AUTO_WORKERS_PER_HCPU})"
+        )
+    else:
+        print("[Info] workers mode: manual")
     print(f"[Info] cpa base url: {cpa_base_url}")
     print(
         f"[Info] stage limits: mailbox={mailbox_limit or 'unlimited'}, "

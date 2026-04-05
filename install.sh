@@ -38,8 +38,11 @@ Install options:
 
 App options:
   未识别的参数会原样透传给当前 Python 主程序。
+  支持自动线程参数：
+    --auto-workers            => 按可用 CPU 自动计算 workers（44 threads / hcpu）
   兼容旧参数名：
     --worker-count / --threads  => --workers
+    --auto-threads             => --auto-workers
     --proxy-url                 => --proxy
     --cpa-path                  => --cpa-base-url
     --cpa-password              => --cpa-token
@@ -47,6 +50,8 @@ App options:
     --use-proxy false           => --proxy direct
 
 Notes:
+  安装脚本会在检测到 Node.js 缺失时自动尝试安装 nodejs。
+  检测到 Python 或 venv 缺失时，会先尝试执行 sudo apt install python3-venv -y。
   安装脚本会在检测到 Python < 3.10 或缺少 venv 时自动尝试安装新版本 Python。
   如果系统包管理器无法提供 Python 3.10+，会回退到 uv 托管安装 Python 3.12。
 
@@ -57,7 +62,7 @@ Examples:
     bash -s -- \
       --cpu-quota 80% \
       --memory-max 1G \
-      --workers 50 \
+      --auto-workers \
       --cpa-base-url http://127.0.0.1:8317 \
       --cpa-token your-token \
       --proxy http://127.0.0.1:7890 \
@@ -121,6 +126,22 @@ python_cmd_has_venv() {
   local candidate="$1"
   command_exists_in_path "$candidate" || return 1
   "$candidate" -m venv -h >/dev/null 2>&1
+}
+
+node_cmd_exists() {
+  command -v node >/dev/null 2>&1 || command -v nodejs >/dev/null 2>&1
+}
+
+resolve_node_command() {
+  if command -v node >/dev/null 2>&1; then
+    command -v node
+    return 0
+  fi
+  if command -v nodejs >/dev/null 2>&1; then
+    command -v nodejs
+    return 0
+  fi
+  return 1
 }
 
 pick_compatible_python() {
@@ -339,6 +360,74 @@ install_python_with_uv() {
   fi
 
   printf '%s\n' "$resolved"
+}
+
+ensure_python_baseline_with_apt() {
+  if ! command -v apt-get >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local has_python=0
+  local has_venv=0
+
+  if command_exists_in_path "$PYTHON_BIN" || command_exists_in_path python3 || command_exists_in_path python; then
+    has_python=1
+  fi
+  if python_cmd_has_venv "$PYTHON_BIN" || python_cmd_has_venv python3 || python_cmd_has_venv python; then
+    has_venv=1
+  fi
+
+  if [[ "$has_python" -eq 1 && "$has_venv" -eq 1 ]]; then
+    return 0
+  fi
+
+  echo "检测到 Python 或 venv 缺失，先执行: sudo apt install python3-venv -y" >&2
+  apt_run apt-get update
+  apt_run apt-get install -y python3-venv
+
+  if ! command_exists_in_path python3; then
+    apt_run apt-get install -y python3
+  fi
+}
+
+install_nodejs_with_apt() {
+  apt_run apt-get update
+  if apt_run apt-get install -y nodejs npm; then
+    return 0
+  fi
+  apt_run apt-get install -y nodejs
+}
+
+install_nodejs_with_dnf_family() {
+  local pm="$1"
+  run_as_root "$pm" install -y nodejs >/dev/null 2>&1
+}
+
+ensure_nodejs_available() {
+  local resolved=""
+
+  if node_cmd_exists; then
+    return 0
+  fi
+
+  echo "检测到 Node.js 缺失，开始自动安装..." >&2
+
+  if command -v apt-get >/dev/null 2>&1; then
+    install_nodejs_with_apt || true
+  elif command -v dnf >/dev/null 2>&1; then
+    install_nodejs_with_dnf_family dnf || true
+  elif command -v yum >/dev/null 2>&1; then
+    install_nodejs_with_dnf_family yum || true
+  fi
+
+  resolved="$(resolve_node_command || true)"
+  if [[ -n "$resolved" ]]; then
+    echo "Node.js 已就绪: ${resolved}" >&2
+    return 0
+  fi
+
+  echo "自动安装 Node.js 失败，请手动安装 nodejs 后重试。" >&2
+  exit 1
 }
 
 download_repo_source() {
@@ -572,6 +661,10 @@ while (($# > 0)); do
       APP_ARGS+=("--workers" "${1#*=}")
       shift
       ;;
+    --auto-workers|--auto-threads)
+      APP_ARGS+=("--auto-workers")
+      shift
+      ;;
     --proxy-url)
       APP_ARGS+=("--proxy" "$2")
       shift 2
@@ -651,7 +744,9 @@ done
 
 print_ignored_app_option_warnings
 
+ensure_python_baseline_with_apt
 ensure_python_310_or_newer
+ensure_nodejs_available
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
