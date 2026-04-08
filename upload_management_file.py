@@ -6,9 +6,10 @@ import time
 
 
 class ZeaburAuthFileManager:
-    def __init__(self, base_url: str, token: str):
+    def __init__(self, base_url: str, token: str, timeout: float = 30.0):
         self.base_url = base_url.rstrip("/")
         self.log_path = Path(__file__).resolve().with_name("cleanup_error.log")
+        self.timeout = float(timeout)
         self.session = requests.Session()
         self.session.headers.update({
             "accept": "application/json, text/plain, */*",
@@ -28,7 +29,7 @@ class ZeaburAuthFileManager:
 
         with open(file_path, "rb") as f:
             files = {"file": (file_name, f, "application/json")}
-            response = self.session.post(url, files=files)
+            response = self.session.post(url, files=files, timeout=self.timeout)
 
         data = self._handle_response(response)
         success = response.status_code == 200 and data.get("status") == "ok"
@@ -37,12 +38,12 @@ class ZeaburAuthFileManager:
             print(f"✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈✈v上传成功：{file_name}")
         else:
             print(f"上传失败：{file_name}")
-        file_path.unlink(missing_ok=True)
+        # file_path.unlink(missing_ok=True)
         return success, data
 
     def delete(self, file_name: str):
         url = f"{self.base_url}/v0/management/auth-files"
-        response = self.session.delete(url, params={"name": file_name})
+        response = self.session.delete(url, params={"name": file_name}, timeout=self.timeout)
 
         data = self._handle_response(response)
 
@@ -54,15 +55,19 @@ class ZeaburAuthFileManager:
             return False, data
 
     # ================= 获取所有 =================
-    def list_files(self):
+    def list_files(self, strict: bool = False):
         url = f"{self.base_url}/v0/management/auth-files"
-        response = self.session.get(url)
+        response = self.session.get(url, timeout=self.timeout)
 
         data = self._handle_response(response)
 
         if response.status_code == 200:
             return data.get("files", [])
         else:
+            if strict:
+                raise RuntimeError(
+                    f"获取文件列表失败: http={response.status_code} response={data}"
+                )
             print("❌ 获取列表失败")
             self._append_log(
                 "获取文件列表失败",
@@ -72,6 +77,9 @@ class ZeaburAuthFileManager:
                 ],
             )
             return []
+
+    def count_files(self, strict: bool = False) -> int:
+        return len(self.list_files(strict=strict))
 
     # ================= 检查错误 =================
     def check_error(self):

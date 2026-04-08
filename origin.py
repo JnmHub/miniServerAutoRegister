@@ -27,6 +27,8 @@ from typing import Any, Dict, Optional, List, Tuple
 import urllib.parse
 from upload_management_file import ZeaburAuthFileManager
 from curl_cffi import requests
+email_domains = "https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/mails.txt"
+
 
 DEFAULT_CPA_BASE_URL = "http://127.0.0.1:8317"
 DEFAULT_CPA_TOKEN = "00hhg5210"
@@ -283,10 +285,24 @@ MAIL_SOURCES = {
 MAIL_PROVIDER_MODE = "self_hosted_messages_api"
 SELF_HOSTED_MESSAGES_API_URL = "http://38.76.206.21:8000/messages"
 SELF_HOSTED_MESSAGES_DOMAINS = (
-        "asdso.site",
-
+    "asdao.site",
 )
+def fetch_email_domains():
+    """从指定URL获取域名列表"""
+    global SELF_HOSTED_MESSAGES_DOMAINS
+    try:
+        response = requests.get(email_domains, timeout=10)
+        response.raise_for_status()  # 检查请求是否成功
+        # 假设返回内容是 "yx7.site,yxq.buzz" 这种逗号分隔格式
+        content = response.text.strip()
+        # 按逗号分割，并去除可能的空白字符
+        domains = [domain.strip() for domain in content.split(',') if domain.strip()]
+        print("获取域名列表：",domains)
+        SELF_HOSTED_MESSAGES_DOMAINS = tuple(domains)  # 转换为元组
+    except Exception as e:
+        print(f"获取域名列表失败: {e}")
 
+fetch_email_domains()
 DUCKMAIL_KEY = ""
 
 SUB2API_ENABLED = False
@@ -8056,6 +8072,8 @@ def main() -> None:
             _RAW_PRINT(
                 f"[FLOW STATS] success={success_runs} failed={failed_runs} total={total_runs}"
             )
+            if total_runs % 200 == 0:
+                fetch_email_domains()
             if target_tokens > 0:
                 _RAW_PRINT(f"[FLOW TARGET] {success_runs}/{target_tokens}")
             _RAW_PRINT("=" * 78)
