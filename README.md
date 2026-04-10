@@ -1,8 +1,8 @@
 # miniServerAutoRegister
 
-当前主入口是 `origin.py`。
+当前仓库默认主入口是 `origin.py`，同时 `install.sh` 也兼容 `a_decayprobe3.py` 和 `auto_pool_maintainer.py`。
 
-`install.sh` 会优先使用 `origin.py` 启动当前版本，并兼容一部分旧参数别名。默认 CPA 地址是 `http://127.0.0.1:8317`。
+`install.sh` 默认优先顺序是 `origin.py` -> `a_decayprobe3.py` -> `auto_pool_maintainer.py`；也可以用 `--app-entry` 强制指定入口。默认 CPA 地址是 `http://127.0.0.1:8317`。
 
 ## 快速开始
 
@@ -20,6 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/
     --cpu-quota 50% \
     --memory-max 50% \
     --auto-workers
+     --app-entry a_decayprobe3.py
 ```
 
 其他参数都不填时，会继续使用程序默认值。
@@ -46,11 +47,18 @@ curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/
 bash install.sh --source-dir . --no-run --workers 10 --once
 ```
 
+使用 `a_decayprobe3.py` 作为入口安装：
+
+```bash
+bash install.sh --source-dir . --app-entry a_decayprobe3.py --workers 10 --once
+```
+
 ## 当前启动方式
 
 - 安装脚本默认在 Linux 且可用 `systemd` 时创建并启动 `mini-server-auto-register.service`
 - 如果系统 Python 低于 3.10 或缺少 `venv`，安装脚本会自动尝试安装新版本 Python
-- 当前仓库主程序是 `origin.py`，安装脚本会自动识别；只有旧仓库快照才会回退到 `auto_pool_maintainer.py`
+- 当前仓库默认主程序是 `origin.py`，安装脚本也支持 `a_decayprobe3.py` 和 `auto_pool_maintainer.py`
+- 如需强制切换入口，可传 `--app-entry a_decayprobe3.py`
 - 当前默认 CPA URL 为 `http://127.0.0.1:8317`
 - 当前默认代理为本地自动探测的 Clash/V2RayN 地址；传 `--proxy direct` 或 `--proxy off` 可关闭代理
 
@@ -66,15 +74,18 @@ bash install.sh --source-dir . --no-run --workers 10 --once
 | `--repo-name` | GitHub 仓库名，默认 `miniServerAutoRegister` |
 | `--python-bin` | 指定 Python 可执行文件，默认 `python3` |
 | `--source-dir` | 使用本地源码目录，跳过 GitHub 下载 |
+| `--app-entry` | 指定 Python 主入口，例如 `origin.py` / `a_decayprobe3.py` |
 | `--use-systemd` | 是否启用 `systemd` 守护，默认 `true` |
 | `--cpu-quota` | `systemd` CPU 限额，例如 `50%`、`80%` |
 | `--memory-max` | `systemd` 内存限制，例如 `512M`、`1G` |
 | `--service-name` | `systemd` 服务名，默认 `mini-server-auto-register` |
 | `--no-run` | 只安装，不立即启动 |
 
-## origin.py 常用参数
+## 当前入口常用参数
 
-这些参数会传给当前主程序 `origin.py`：
+这些参数会传给当前主程序；`origin.py` 和 `a_decayprobe3.py` 的主体参数基本一致。
+
+其中 `--auto-workers` 属于 `install.sh` 的兼容增强参数：安装脚本会先按 `44 threads / hcpu` 算出实际值，再改写成 `--workers N` 传给入口程序；如果你是直接运行 `a_decayprobe3.py`，请直接传 `--workers`。
 
 | 参数 | 说明 |
 | --- | --- |
@@ -85,7 +96,7 @@ bash install.sh --source-dir . --no-run --workers 10 --once
 | `--sleep-min` | 循环模式最短等待秒数 |
 | `--sleep-max` | 循环模式最长等待秒数 |
 | `--workers` | 并发线程数 |
-| `--auto-workers` | 按可用 CPU 自动计算线程数 |
+| `--auto-workers` | 通过 `install.sh` 自动换算为 `--workers` |
 | `--mailbox-limit` | 邮箱申请阶段并发上限，`0` 表示不限制 |
 | `--otp-limit` | 验证码轮询阶段并发上限，`0` 表示不限制 |
 | `--register-limit` | 注册阶段并发上限，`0` 表示不限制 |
@@ -114,6 +125,7 @@ bash install.sh --source-dir . --no-run --workers 10 --once
 
 ```bash
 python3 origin.py --help
+python3 a_decayprobe3.py --help
 ```
 
 ## 推荐启动示例
@@ -163,7 +175,7 @@ python3 origin.py --workers 20 --once
 | `--loop-mode false` | `--once` |
 | `--use-proxy false` | `--proxy direct` |
 
-以下旧参数在当前 `origin.py` 中已经不再支持；通过 `install.sh` 传入时会被忽略并输出提示：
+以下旧参数在当前入口程序中已经不再支持；通过 `install.sh` 传入时会被忽略并输出提示：
 
 - `--account-password`
 - `--password`
@@ -206,7 +218,7 @@ journalctl --user -u mini-server-auto-register.service -f
 
 - `app/`：程序源码
 - `runtime/`：运行目录
-- `runtime/config.json`：安装脚本复制的运行配置文件
+- `runtime/config.json`：仅在入口为 `auto_pool_maintainer.py` 时才需要
 - `runtime/logs/`：日志目录
 - `.venv/`：Python 虚拟环境
 - `run.sh`：统一启动入口，`systemd` 和手动启动都走这个脚本

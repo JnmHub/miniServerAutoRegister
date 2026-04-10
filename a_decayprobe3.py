@@ -5,6 +5,7 @@ import sys
 import time
 import uuid
 import math
+import gc
 import random
 import string
 import secrets
@@ -14,103 +15,48 @@ import tempfile
 import threading
 import argparse
 import subprocess
-import shutil
-import builtins as _builtins
+import ctypes
+import builtins
+import imaplib
+import email
+import html
+import requests as std_requests
+from email import policy
+from email.parser import BytesParser
+from email.utils import parsedate_to_datetime
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
-from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List, Tuple
 import urllib.parse
+
 from upload_management_file import ZeaburAuthFileManager
 from curl_cffi import requests
-email_domains = "https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/mails.txt"
+
+
+def _configure_stdio() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_configure_stdio()
 
 
 DEFAULT_CPA_BASE_URL = "http://127.0.0.1:8317"
 DEFAULT_CPA_TOKEN = "00hhg5210"
-AUTO_WORKERS_PER_HCPU = 44
-MIN_NODE_MAJOR = 18
-_RAW_PRINT = _builtins.print
-_VERBOSE_LOGS = str(os.environ.get("ORIGIN_VERBOSE_LOGS", "")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-
-
-def _set_verbose_logs(enabled: bool) -> None:
-    global _VERBOSE_LOGS
-    _VERBOSE_LOGS = bool(enabled)
-
-
-def _should_emit_log_line(text: str) -> bool:
-    if _VERBOSE_LOGS:
-        return True
-
-    stripped = str(text or "").strip()
-    if not stripped:
-        return True
-
-    if re.fullmatch(r"\.+", stripped):
-        return False
-
-    if stripped.startswith("[*] target tokens reached"):
-        return True
-    if ">>> worker " in stripped and " start <<<" in stripped:
-        return False
-
-    noisy_prefixes = (
-        "[*] ",
-        "[Retry] ",
-        "[Run] ",
-        "[Net] ",
-        "[Blacklist] ",
-        "[Quarantine] ",
-        "[SentinelSuspect] ",
-        "[NoBlacklist] ",
-        ">>> worker ",
-        "[-] worker ",
-    )
-    if stripped.startswith(noisy_prefixes):
-        return False
-
-    if stripped.startswith("[Sub2Api] 推送成功"):
-        return False
-    if stripped.startswith("[V2RayN] probe "):
-        return False
-
-    noisy_markers = (
-        "正在等待邮箱 ",
-        "抓到啦! 验证码",
-        "收到 OpenAI 邮件但未提取到链接/验证码",
-        "找到验证链接!",
-        "找到验证码:",
-    )
-    if any(marker in stripped for marker in noisy_markers):
-        return False
-
-    noisy_exact = {
-        "超时",
-        "超时，未收到验证码",
-        "alpha-infini 暂未实现验证码轮询",
-    }
-    if stripped in noisy_exact or stripped.startswith("超时"):
-        return False
-
-    return True
-
-
-def print(*args: Any, **kwargs: Any) -> None:
-    sep = kwargs.get("sep", " ")
-    text = sep.join(str(arg) for arg in args)
-    if not _should_emit_log_line(text):
-        return
-    _RAW_PRINT(*args, **kwargs)
+REMOTE_FILE_LIMIT_CHECK_INTERVAL_SECONDS = max(
+    30,
+    int(os.environ.get("REMOTE_FILE_LIMIT_CHECK_INTERVAL_SECONDS", "300") or 300),
+)
 
 
 def _read_first_env_value(*names: str, default: str = "") -> str:
@@ -139,116 +85,6 @@ def _resolve_cpa_settings(
     return base_url, token
 
 
-manage = ZeaburAuthFileManager(*_resolve_cpa_settings())
-
-def _configure_stdio() -> None:
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        if stream is None or not hasattr(stream, "reconfigure"):
-            continue
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
-
-_configure_stdio()
-
-
-_warned_node_binaries = set()
-
-
-def _node_major_version(executable: str) -> int:
-    try:
-        result = subprocess.run(
-            [executable, "-v"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-            check=False,
-        )
-        raw = str(result.stdout or result.stderr or "").strip()
-        match = re.match(r"^v(\d+)", raw)
-        if match:
-            return int(match.group(1))
-    except Exception:
-        pass
-    return 0
-
-
-def _find_node_executable() -> str:
-    for candidate in ("node", "nodejs"):
-        resolved = shutil.which(candidate)
-        if resolved:
-            major = _node_major_version(resolved)
-            if major >= MIN_NODE_MAJOR:
-                return resolved
-            if resolved not in _warned_node_binaries:
-                _warned_node_binaries.add(resolved)
-                print(
-                    f"[Warn] Node.js version too low: {resolved} "
-                    f"(detected v{major or 'unknown'}, require >= {MIN_NODE_MAJOR})"
-                )
-    return ""
-
-
-def _read_text_file(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
-
-
-def _detect_cgroup_cpu_limit() -> Optional[float]:
-    cpu_max_text = _read_text_file("/sys/fs/cgroup/cpu.max")
-    if cpu_max_text:
-        parts = cpu_max_text.split()
-        if len(parts) >= 2 and parts[0] != "max":
-            try:
-                quota = float(parts[0])
-                period = float(parts[1])
-                if quota > 0 and period > 0:
-                    return quota / period
-            except Exception:
-                pass
-
-    quota_text = _read_text_file("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
-    period_text = _read_text_file("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
-    if quota_text and period_text:
-        try:
-            quota = float(quota_text)
-            period = float(period_text)
-            if quota > 0 and period > 0:
-                return quota / period
-        except Exception:
-            pass
-    return None
-
-
-def _detect_effective_cpu_count() -> float:
-    logical = float(os.cpu_count() or 1)
-    affinity_count = 0.0
-    try:
-        affinity_count = float(len(os.sched_getaffinity(0)))
-    except Exception:
-        affinity_count = 0.0
-
-    effective = affinity_count if affinity_count > 0 else logical
-    cgroup_limit = _detect_cgroup_cpu_limit()
-    if cgroup_limit and cgroup_limit > 0:
-        effective = min(effective, cgroup_limit)
-    return max(0.1, effective)
-
-
-def _compute_auto_workers() -> Tuple[int, float]:
-    cpu_units = _detect_effective_cpu_count()
-    workers = max(1, int(math.floor(cpu_units * AUTO_WORKERS_PER_HCPU + 0.5)))
-    return workers, cpu_units
-
-
 class RetryNewEmail(RuntimeError):
     pass
 
@@ -273,40 +109,44 @@ class DropMailAuthError(RuntimeError):
 # ==========================================
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 MAIL_SOURCES = {
     "self_hosted_messages_api": True,
-    "dropmail": False,
-    "tempmail_lol": False,
-    "skymail": False,
-    "onesecmail": False,
-    "duckmail": False,
-    "mailtm": False,
 }
 MAIL_PROVIDER_MODE = "self_hosted_messages_api"
 SELF_HOSTED_MESSAGES_API_URL = "http://38.76.206.21:8000/messages"
 SELF_HOSTED_MESSAGES_DOMAINS = (
     "yx7.site",
 )
-def fetch_email_domains():
+email_domains = "https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/mails.txt"
+
+
+def fetch_email_domains(proxy: Optional[str] = None) -> None:
     """从指定URL获取域名列表"""
     global SELF_HOSTED_MESSAGES_DOMAINS
     try:
-        response = requests.get(email_domains, timeout=10)
-        response.raise_for_status()  # 检查请求是否成功
+        response = requests.get(
+            email_domains,
+            proxies=_build_proxies(proxy),
+            impersonate="chrome",
+            timeout=10,
+        )
+        response.raise_for_status()
         content = response.text.strip()
-        domains = [domain.strip() for domain in content.split(',') if domain.strip()]
-        print("获取域名列表：",domains)
-        SELF_HOSTED_MESSAGES_DOMAINS = tuple(domains)  # 转换为元组
+        domains = [domain.strip() for domain in content.split(",") if domain.strip()]
+        if domains:
+            print("获取域名列表：", domains)
+            SELF_HOSTED_MESSAGES_DOMAINS = tuple(domains)
     except Exception as e:
         print(f"获取域名列表失败: {e}")
 
-fetch_email_domains()
 DUCKMAIL_KEY = ""
 
 SUB2API_ENABLED = False
-SUB2API_URL = "http://uc.hicd.cc:8080"
-SUB2API_EMAIL = "admin@sub2api.local"
-SUB2API_PASSWORD = "1l123451"
+TEST_DISABLE_SUB2API = True
+SUB2API_URL = ""
+SUB2API_EMAIL = ""
+SUB2API_PASSWORD = ""
 
 # V2RayN 本地代理（默认走 127.0.0.1:10808，协议自动探测）
 V2RAYN_PROXY = "127.0.0.1:7897"
@@ -327,6 +167,66 @@ FAILED_CREATE_BLACKLIST_THRESHOLD = 12
 AUTH_SESSION_MINIMIZED_COOKIE = "auth-session-minimized-client-checksum"
 SKYMAIL_CONFIG_FILE = os.path.join(SCRIPT_DIR, "skymail_config.json")
 SKYMAIL_FALLBACK_CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+SENTINEL_SUPPORT_DIR = os.path.join(SCRIPT_DIR, ".sentinel_support")
+CUSTOM_MAIL_WEBUI = os.environ.get("CUSTOM_MAIL_WEBUI", "").strip()
+CUSTOM_MAIL_API_BASE = os.environ.get("CUSTOM_MAIL_API_BASE", "").strip()
+CUSTOM_MAIL_ROOT_DOMAIN = os.environ.get("CUSTOM_MAIL_ROOT_DOMAIN", "").strip().lower()
+CUSTOM_MAIL_IMAP_HOST = os.environ.get("CUSTOM_MAIL_IMAP_HOST", "").strip()
+CUSTOM_MAIL_IMAP_PORT = int(os.environ.get("CUSTOM_MAIL_IMAP_PORT", "993") or 993)
+CUSTOM_MAIL_IMAP_USER = os.environ.get("CUSTOM_MAIL_IMAP_USER", "").strip()
+CUSTOM_MAIL_IMAP_PASSWORD = os.environ.get("CUSTOM_MAIL_IMAP_PASSWORD", "").strip()
+CUSTOM_MAIL_ADMIN_USER = os.environ.get("CUSTOM_MAIL_ADMIN_USER", "").strip()
+CUSTOM_MAIL_ADMIN_PASSWORD = os.environ.get("CUSTOM_MAIL_ADMIN_PASSWORD", "").strip()
+CUSTOM_MAIL_API_KEY = os.environ.get("CUSTOM_MAIL_API_KEY", "").strip()
+CUSTOM_MAIL_SMTP_USER = os.environ.get("CUSTOM_MAIL_SMTP_USER", "").strip()
+CUSTOM_MAIL_SMTP_PASSWORD = os.environ.get("CUSTOM_MAIL_SMTP_PASSWORD", "").strip()
+CUSTOM_MAIL_POLL_MAX_MESSAGES = 12
+CUSTOM_MAIL_HTTP_TIMEOUT = 15
+MEMORY_SOFT_LIMIT_MB = int(os.environ.get("MEMORY_SOFT_LIMIT_MB", "4096") or 4096)
+MEMORY_SOFT_LIMIT_BYTES = max(512, MEMORY_SOFT_LIMIT_MB) * 1024 * 1024
+MEMORY_POLL_INTERVAL_SECONDS = max(1.0, float(os.environ.get("MEMORY_POLL_INTERVAL_SECONDS", "2.0") or 2.0))
+CUSTOM_MAIL_CONNECT_TIMEOUT = float(os.environ.get("CUSTOM_MAIL_CONNECT_TIMEOUT", "4") or 4)
+CUSTOM_MAIL_READ_TIMEOUT = float(os.environ.get("CUSTOM_MAIL_READ_TIMEOUT", "6") or 6)
+CUSTOM_MAIL_HTTP_RETRIES = int(os.environ.get("CUSTOM_MAIL_HTTP_RETRIES", "2") or 2)
+CUSTOM_MAIL_IMAP_FALLBACK = str(os.environ.get("CUSTOM_MAIL_IMAP_FALLBACK", "1")).strip().lower() not in {"0", "false", "off", "no"}
+CUSTOM_MAIL_NEGATIVE_CACHE_TTL = float(os.environ.get("CUSTOM_MAIL_NEGATIVE_CACHE_TTL", "0.35") or 0.35)
+CUSTOM_MAIL_RESULT_CACHE_TTL = float(os.environ.get("CUSTOM_MAIL_RESULT_CACHE_TTL", "2.0") or 2.0)
+PROXY_TRACE_CACHE_TTL_SECONDS = max(5.0, float(os.environ.get("PROXY_TRACE_CACHE_TTL_SECONDS", "90") or 90.0))
+HOT_LOG_MAX_WORKERS = max(1, int(os.environ.get("HOT_LOG_MAX_WORKERS", "64") or 64))
+EXPERIMENT2_IO_MAX_WORKERS = max(1, int(os.environ.get("EXPERIMENT2_IO_MAX_WORKERS", "64") or 64))
+_raw_print = builtins.print
+
+
+def _should_emit_log_line(text: str) -> bool:
+    workers = max(1, int(globals().get("_worker_count_hint") or 1))
+    if workers < 256:
+        return True
+    line = str(text or "").strip()
+    if not line:
+        return True
+    if "<!DOCTYPE html>" in line or "Just a moment..." in line:
+        return False
+    for prefix in ("[Build]", "[Info]", "[Warn]", "[Error]", "[Retry]", "[Sub2Api]", "[-]"):
+        if line.startswith(prefix):
+            return True
+    if line.startswith("[*]"):
+        keep = (
+            "saved token json",
+            "appended access token",
+            "appended refresh token",
+            "target progress",
+            "custom tuning",
+            "runtime recycle",
+            "memory soft limit",
+        )
+        return any(marker in line for marker in keep)
+    return False
+
+
+def print(*args: Any, **kwargs: Any) -> None:
+    text = " ".join(str(arg) for arg in args)
+    if _should_emit_log_line(text):
+        _raw_print(*args, **kwargs)
 
 # ==========================================
 # 临时邮箱 API
@@ -341,16 +241,19 @@ DROPMAIL_TOKEN_RENEW_URL = "https://dropmail.me/api/token/renew"
 DROPMAIL_GRAPHQL_BASE = "https://dropmail.me/api/graphql"
 SKYMAIL_TOKEN_TTL_SECONDS = 20 * 60
 DROPMAIL_PRIMARY_DOMAINS = [
-    "10mail.info",
-    "mimimail.me",
-    "mailpwr.com",
-    "maximail.fyi",
+    "pickmail.org",
+    "pickmemail.com",
 ]
 DROPMAIL_BACKUP_DOMAINS = [
     "10mail.org",
     "emlhub.com",
     "emltmp.com",
     "freeml.net",
+    "10mail.xyz",
+    "dropmail.me",
+    "emlpro.com",
+    "mail2me.co",
+    "mailtowin.com",
     "maximail.vip",
     "yomail.info",
 ]
@@ -417,6 +320,11 @@ _beta2_low_domain_pool = [
     "ek.cloudvxz.com",
     "si.cloudvxz.com",
 ]
+_TEMPMAIL_FORCE_DOMAINS = [
+    "54.accesswiki.net",
+    "n9.tohal.org",
+    "q4.shopsprint.org",
+]
 _alpha_infini_domain_pool = [
     "qir.infini-ai.eu.cc",
     "qor.infini-ai.eu.cc",
@@ -446,11 +354,14 @@ _stage_limiters: Dict[str, Optional[threading.BoundedSemaphore]] = {
     "otp": None,
     "register": None,
 }
+_proxy_trace_cache_lock = threading.Lock()
+_proxy_trace_cache: Dict[str, Dict[str, Any]] = {}
 _experiment_enabled = False
 _experiment2_enabled = False
 _beta_enabled = False
 _beta2_enabled = False
 _alpha_enabled = False
+_custom_enabled = False
 _skymail_preferred = False
 _legacy_mail_mode = False
 _dropmail_pool_mode = "primary"
@@ -462,7 +373,7 @@ _experiment2_fresh_count = 8
 _experiment2_fresh_lengths = [2]
 _experiment2_fresh_pool: List[str] = []
 _TRANSIENT_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
-DEFAULT_RUN_RETRIES = 2
+DEFAULT_RUN_RETRIES = 1
 DEFAULT_EMAIL_SOURCE_ROUNDS = 4
 TEMPMAIL_LOL_MAX_CREATE_ATTEMPTS = 30
 SENTINEL_FLOW_SIGNUP_EMAIL = "authorize_continue"
@@ -492,18 +403,66 @@ _sentinel_sdk_cache_lock = threading.Lock()
 _sentinel_sdk_cache: Dict[str, Dict[str, Any]] = {}
 _sentinel_requirements_cache_lock = threading.Lock()
 _sentinel_requirements_cache: Dict[str, Any] = {"token": "", "expires_at_ts": 0.0}
+_sentinel_transform_cache_lock = threading.Lock()
+_sentinel_transform_cache: Dict[str, Dict[str, Any]] = {}
+_sentinel_exact_cache_lock = threading.Lock()
+_sentinel_exact_cache: Dict[str, Dict[str, Any]] = {}
+_sentinel_worker_lock = threading.Lock()
+_sentinel_worker_process: Any = None
 _skymail_config_lock = threading.Lock()
 _skymail_config_cache: Optional[Dict[str, Any]] = None
 _skymail_token_lock = threading.RLock()
 _skymail_token_cache: Dict[str, Any] = {"token": "", "expires_at_ts": 0.0}
 _skymail_used_codes_lock = threading.Lock()
 _skymail_used_codes: set = set()
+_custom_http_tls = threading.local()
+_custom_http_slots: Optional[threading.BoundedSemaphore] = None
+_custom_otp_wait_slots: Optional[threading.BoundedSemaphore] = None
+_active_run_slots: Optional[threading.BoundedSemaphore] = None
+_signup_http_slots: Optional[threading.BoundedSemaphore] = None
+_signup_cooldown_lock = threading.Lock()
+_signup_cooldown_until_ts = 0.0
+_signup_rate_lock = threading.Lock()
+_signup_next_allowed_ts = 0.0
+_signup_spacing_seconds = 0.0
+_custom_http_shared_session_lock = threading.Lock()
+_custom_http_shared_session: Optional[std_requests.Session] = None
+_custom_http_shared_created_at = 0.0
+_custom_http_cache_lock = threading.Lock()
+_custom_http_cache: Dict[str, Dict[str, Any]] = {}
+_custom_global_poll_lock = threading.Lock()
+_custom_global_poll_cv = threading.Condition(_custom_global_poll_lock)
+_custom_global_poll_by_recipient: Dict[str, List[Dict[str, Any]]] = {}
+_custom_global_poll_expires_at = 0.0
+_custom_global_poll_refreshing = False
+_custom_batch_watch_lock = threading.Lock()
+_custom_batch_watch_cv = threading.Condition(_custom_batch_watch_lock)
+_custom_batch_watchers: Dict[str, float] = {}
+_custom_batch_cache_by_recipient: Dict[str, List[Dict[str, Any]]] = {}
+_custom_batch_cache_expires_at = 0.0
+_custom_batch_refreshing = False
+_custom_batch_dispatch_stop_event = threading.Event()
+_custom_batch_async_enabled_flag = False
 _local_browser_profile_lock = threading.Lock()
 _local_browser_profile_cache: Optional[tuple] = None
+_memory_control_lock = threading.Lock()
+_memory_pause_new_runs = False
+_memory_recycle_count = 0
+_memory_last_reported_bytes = 0
+_memory_high_water_bytes = 0
+_remote_file_limit_lock = threading.Lock()
+_remote_file_limit_pause_new_runs = False
+_remote_file_limit_current_count = -1
+_remote_file_limit_max_count = 0
+_active_run_count_lock = threading.Lock()
+_active_run_count = 0
+_memory_manager_stop_event = threading.Event()
 _run_session_id = (
     f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
     f"-p{os.getpid()}-{secrets.token_hex(2)}"
 )
+_worker_backoff_lock = threading.Lock()
+_worker_backoff_by_slot: Dict[int, Dict[str, float]] = {}
 
 
 def _dedupe_keep_order(items: List[str]) -> List[str]:
@@ -515,6 +474,165 @@ def _dedupe_keep_order(items: List[str]) -> List[str]:
         seen.add(item)
         result.append(item)
     return result
+
+
+def _hot_log_enabled() -> bool:
+    return int(_worker_count_hint or 1) <= HOT_LOG_MAX_WORKERS
+
+
+def _experiment2_io_enabled() -> bool:
+    return int(_worker_count_hint or 1) <= EXPERIMENT2_IO_MAX_WORKERS
+
+
+class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_ulong),
+        ("PageFaultCount", ctypes.c_ulong),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+def _process_rss_bytes() -> int:
+    if os.name == "nt":
+        counters = _PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(_PROCESS_MEMORY_COUNTERS)
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+            handle,
+            ctypes.byref(counters),
+            counters.cb,
+        )
+        if ok:
+            return int(counters.WorkingSetSize or 0)
+    return 0
+
+
+def _format_bytes(num_bytes: int) -> str:
+    value = float(max(0, int(num_bytes or 0)))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)}{unit}"
+            return f"{value:.1f}{unit}"
+        value /= 1024.0
+    return f"{int(num_bytes)}B"
+
+
+def _active_run_enter() -> None:
+    global _active_run_count
+    with _active_run_count_lock:
+        _active_run_count += 1
+
+
+def _active_run_leave() -> None:
+    global _active_run_count
+    with _active_run_count_lock:
+        _active_run_count = max(0, int(_active_run_count) - 1)
+
+
+def _active_run_snapshot() -> int:
+    with _active_run_count_lock:
+        return int(_active_run_count or 0)
+
+
+def _runtime_recycle_memory_state() -> None:
+    global _sentinel_worker_process, _custom_http_shared_session, _custom_http_shared_created_at
+    with _sentinel_worker_lock:
+        proc = _sentinel_worker_process
+        _sentinel_worker_process = None
+    if proc is not None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    with _sentinel_requirements_cache_lock:
+        _sentinel_requirements_cache["token"] = ""
+        _sentinel_requirements_cache["expires_at_ts"] = 0.0
+    with _sentinel_transform_cache_lock:
+        _sentinel_transform_cache.clear()
+    with _sentinel_exact_cache_lock:
+        _sentinel_exact_cache.clear()
+    with _custom_http_cache_lock:
+        _custom_http_cache.clear()
+    with _custom_http_shared_session_lock:
+        session = _custom_http_shared_session
+        _custom_http_shared_session = None
+        _custom_http_shared_created_at = 0.0
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
+    try:
+        _custom_http_tls.session = None
+        _custom_http_tls.logged_in_at = 0.0
+    except Exception:
+        pass
+    gc.collect()
+
+
+def _wait_for_memory_window() -> None:
+    while True:
+        with _memory_control_lock:
+            paused = bool(_memory_pause_new_runs)
+        if not paused:
+            return
+        time.sleep(0.5)
+
+
+def _wait_for_remote_file_limit_window() -> None:
+    while True:
+        with _remote_file_limit_lock:
+            limit = max(0, int(_remote_file_limit_max_count or 0))
+            paused = bool(_remote_file_limit_pause_new_runs) if limit > 0 else False
+        if not paused:
+            return
+        stop_event = globals().get("_stop_event")
+        try:
+            if stop_event is not None and stop_event.is_set():
+                return
+        except Exception:
+            return
+        time.sleep(0.5)
+
+
+def _memory_manager_loop() -> None:
+    global _memory_pause_new_runs, _memory_recycle_count, _memory_last_reported_bytes, _memory_high_water_bytes
+    while not _memory_manager_stop_event.wait(MEMORY_POLL_INTERVAL_SECONDS):
+        rss_bytes = _process_rss_bytes()
+        if rss_bytes > _memory_high_water_bytes:
+            _memory_high_water_bytes = rss_bytes
+        if rss_bytes >= MEMORY_SOFT_LIMIT_BYTES:
+            with _memory_control_lock:
+                if not _memory_pause_new_runs:
+                    _memory_pause_new_runs = True
+                    _memory_last_reported_bytes = rss_bytes
+                    print(
+                        f"[*] memory soft limit hit: {_format_bytes(rss_bytes)} / "
+                        f"{_format_bytes(MEMORY_SOFT_LIMIT_BYTES)}; "
+                        "draining active workers before runtime recycle"
+                    )
+        should_recycle = False
+        with _memory_control_lock:
+            if _memory_pause_new_runs and _active_run_snapshot() <= 0:
+                should_recycle = True
+        if should_recycle:
+            _runtime_recycle_memory_state()
+            with _memory_control_lock:
+                _memory_pause_new_runs = False
+                _memory_recycle_count += 1
+            print(
+                f"[*] runtime recycle complete; high-water={_format_bytes(_memory_high_water_bytes)} "
+                f"recycles={_memory_recycle_count}"
+            )
 
 
 def _current_run_context() -> Optional[Dict[str, Any]]:
@@ -560,6 +678,46 @@ def _append_run_context_value(key: str, value: Any) -> None:
 def _clear_run_context() -> None:
     if hasattr(_run_context_local, "state"):
         delattr(_run_context_local, "state")
+
+
+def _worker_backoff_take(worker_slot: int) -> float:
+    slot = max(1, int(worker_slot or 1))
+    now = time.time()
+    with _worker_backoff_lock:
+        state = _worker_backoff_by_slot.get(slot) or {}
+        until_ts = float(state.get("until_ts") or 0.0)
+        if until_ts <= now:
+            _worker_backoff_by_slot.pop(slot, None)
+            return 0.0
+        return max(0.0, until_ts - now)
+
+
+def _worker_backoff_set(worker_slot: int, reason: str) -> None:
+    slot = max(1, int(worker_slot or 1))
+    key = str(reason or "").strip().lower()
+    if not key:
+        return
+    workers = max(1, int(_worker_count_hint or 1))
+    if "signup_http_429" in key:
+        delay = 4.5 if workers >= 1000 else 3.0
+    elif "otp_timeout" in key:
+        delay = 1.6 if workers >= 1000 else 1.0
+    elif "phone_gate" in key:
+        delay = 0.6
+    elif "signup_http_403" in key:
+        delay = 0.8
+    else:
+        delay = 0.0
+    if delay <= 0:
+        return
+    delay += random.uniform(0.0, min(1.2, delay * 0.25))
+    with _worker_backoff_lock:
+        _worker_backoff_by_slot[slot] = {
+            "until_ts": time.time() + delay,
+            "reason": key,
+        }
+
+
 
 
 def _read_jsonl_objects(path: str) -> List[Dict[str, Any]]:
@@ -670,7 +828,7 @@ def _generate_fresh_cloudvxz_domains(count: int, lengths: List[int]) -> List[str
     return generated
 
 
-def _resolve_stage_limit(requested: int) -> Optional[int]:
+def _resolve_stage_limit(requested: int, *, stage_name: str = "") -> Optional[int]:
     if requested > 0:
         return requested
     return None
@@ -681,6 +839,240 @@ def _set_stage_limit(name: str, limit: Optional[int]) -> None:
         _stage_limiters[name] = None
         return
     _stage_limiters[name] = threading.BoundedSemaphore(max(1, limit))
+
+
+def _resolve_custom_http_limit() -> Optional[int]:
+    override = str(os.environ.get("CUSTOM_HTTP_LIMIT_OVERRIDE", "") or "").strip()
+    if override:
+        try:
+            value = int(override)
+            return None if value <= 0 else max(1, value)
+        except Exception:
+            pass
+    workers = max(1, int(_worker_count_hint or 1))
+    if workers >= 3072:
+        return 192
+    if workers >= 1536:
+        return 144
+    if workers >= 1024:
+        return 128
+    if workers >= 512:
+        return 96
+    if workers >= 256:
+        return 64
+    return None
+
+
+def _resolve_custom_otp_wait_limit() -> Optional[int]:
+    override = str(os.environ.get("CUSTOM_OTP_WAIT_LIMIT_OVERRIDE", "") or "").strip()
+    if override:
+        try:
+            value = int(override)
+            return None if value <= 0 else max(1, value)
+        except Exception:
+            pass
+    workers = max(1, int(_worker_count_hint or 1))
+    if workers >= 3072:
+        return 384
+    if workers >= 2048:
+        return 320
+    if workers >= 1024:
+        return 256
+    if workers >= 512:
+        return 192
+    if workers >= 256:
+        return 128
+    return None
+
+
+def _resolve_active_run_limit() -> Optional[int]:
+    override = str(os.environ.get("ACTIVE_RUN_LIMIT_OVERRIDE", "") or "").strip()
+    if override:
+        try:
+            value = int(override)
+            return None if value <= 0 else max(1, value)
+        except Exception:
+            pass
+    workers = max(1, int(_worker_count_hint or 1))
+    if workers >= 3072:
+        return 768
+    if workers >= 1536:
+        return 640
+    if workers >= 1024:
+        return 512
+    if workers >= 512:
+        return 320
+    if workers >= 256:
+        return 192
+    return None
+
+
+def _custom_batch_dispatch_mode() -> str:
+    raw = str(os.environ.get("CUSTOM_BATCH_DISPATCH_MODE", "auto") or "auto").strip().lower()
+    if raw in {"", "auto"}:
+        workers = max(1, int(_worker_count_hint or 1))
+        if bool(globals().get("_custom_enabled")) and workers >= 256:
+            return "async"
+        return "sync"
+    if raw in {"1", "on", "true", "async"}:
+        return "async"
+    if raw in {"0", "off", "false", "sync"}:
+        return "sync"
+    return raw
+
+
+def _custom_batch_async_enabled() -> bool:
+    return bool(globals().get("_custom_batch_async_enabled_flag"))
+
+
+def _custom_otp_wait_acquire_timeout() -> float:
+    workers = max(1, int(_worker_count_hint or 1))
+    if workers >= 2048:
+        return 8.0
+    if workers >= 1024:
+        return 6.0
+    if workers >= 512:
+        return 4.0
+    if workers >= 256:
+        return 2.5
+    return 0.5
+
+
+def _resolve_signup_http_limit() -> Optional[int]:
+    override = str(os.environ.get("SIGNUP_HTTP_LIMIT_OVERRIDE", "") or "").strip()
+    if override:
+        try:
+            value = int(override)
+            return None if value <= 0 else max(1, value)
+        except Exception:
+            pass
+    workers = max(1, int(_worker_count_hint or 1))
+    if workers >= 2048:
+        return 24
+    if workers >= 1024:
+        return 20
+    if workers >= 512:
+        return 16
+    if workers >= 256:
+        return 12
+    return None
+
+
+@contextmanager
+def _custom_http_slot():
+    sem = _custom_http_slots
+    if sem is None:
+        yield
+        return
+    sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
+
+
+@contextmanager
+def _custom_otp_wait_slot():
+    sem = _custom_otp_wait_slots
+    if sem is None:
+        yield True
+        return
+    stop_event = globals().get("_stop_event")
+    deadline = time.time() + _custom_otp_wait_acquire_timeout()
+    acquired = False
+    while not acquired:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        acquired = sem.acquire(timeout=min(0.5, max(0.05, remaining)))
+        if acquired:
+            break
+        try:
+            if stop_event is not None and stop_event.is_set():
+                break
+        except Exception:
+            break
+    if not acquired:
+        # Do not hard-fail the run just because the wait lane is saturated.
+        # At high concurrency the batch dispatcher can still deliver cached OTPs.
+        yield True
+        return
+    try:
+        yield True
+    finally:
+        sem.release()
+
+
+@contextmanager
+def _active_run_slot():
+    sem = _active_run_slots
+    if sem is None:
+        yield
+        return
+    sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
+
+
+def _signup_label_limited(label: str) -> bool:
+    key = str(label or "").strip().lower()
+    if not key:
+        return False
+    return key in {
+        "oauth-entry",
+        "signup-sentinel",
+        "create-account",
+    }
+
+
+def _custom_batch_dispatch_interval() -> float:
+    workers = max(1, int(_worker_count_hint or 1))
+    if workers >= 2048:
+        return 0.18
+    if workers >= 1024:
+        return 0.22
+    if workers >= 512:
+        return 0.28
+    return 0.35
+
+
+def _signup_cooldown_seconds() -> float:
+    override = str(os.environ.get("SIGNUP_COOLDOWN_SECONDS_OVERRIDE", "") or "").strip()
+    if override:
+        try:
+            return max(0.0, float(override))
+        except Exception:
+            pass
+    return 1.5
+
+
+def _signup_spacing_cap_seconds() -> float:
+    return 0.0
+
+
+def _signup_spacing_on_result(status_code: int, label: str) -> None:
+    return
+
+
+@contextmanager
+def _signup_http_slot(label: str):
+    sem = _signup_http_slots if _signup_label_limited(label) else None
+    if sem is None:
+        yield
+        return
+    while True:
+        with _signup_cooldown_lock:
+            wait_more = float(_signup_cooldown_until_ts or 0.0) - time.time()
+        if wait_more <= 0:
+            break
+        time.sleep(min(wait_more, 0.25))
+    sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
 
 
 def _retry_wait(attempt: int, *, base: float = 1.0, cap: float = 8.0) -> float:
@@ -701,10 +1093,18 @@ def _request_with_retries(
 
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            resp = send_fn()
+            with _signup_http_slot(label):
+                resp = send_fn()
+            _signup_spacing_on_result(int(resp.status_code or 0), label)
             if resp.status_code not in retry_statuses or attempt >= attempts:
                 return resp
             last_resp = resp
+            if resp.status_code == 429 and _signup_label_limited(label):
+                with _signup_cooldown_lock:
+                    globals()["_signup_cooldown_until_ts"] = max(
+                        float(globals().get("_signup_cooldown_until_ts") or 0.0),
+                        time.time() + _signup_cooldown_seconds(),
+                    )
             wait_time = _retry_wait(attempt)
             print(
                 f"[Retry] {label} transient status {resp.status_code}; "
@@ -730,7 +1130,85 @@ def _request_with_retries(
 
 
 def _sleep_poll_delay() -> None:
-    time.sleep(random.uniform(2.0, 4.5))
+    if _worker_count_hint >= 256:
+        low, high = 3.5, 7.0
+    elif _worker_count_hint >= 128:
+        low, high = 3.0, 6.0
+    elif _worker_count_hint >= 64:
+        low, high = 2.4, 5.0
+    else:
+        low, high = 2.0, 4.5
+    time.sleep(random.uniform(low, high))
+
+
+def _custom_poll_rounds() -> int:
+    override = str(os.environ.get("CUSTOM_POLL_ROUNDS_OVERRIDE", "") or "").strip()
+    if override:
+        try:
+            return max(1, int(override))
+        except Exception:
+            pass
+    workers = max(1, int(_worker_count_hint or 1))
+    if workers >= 2048:
+        return 10
+    if workers >= 1024:
+        return 12
+    if workers >= 512:
+        return 14
+    if workers >= 256:
+        return 16
+    if workers >= 128:
+        return 18
+    return 40
+
+
+def _sleep_custom_poll_delay() -> None:
+    workers = max(1, int(_worker_count_hint or 1))
+    if workers >= 1024:
+        low, high = 0.6, 1.2
+    elif workers >= 512:
+        low, high = 0.8, 1.4
+    elif workers >= 256:
+        low, high = 1.0, 1.8
+    elif workers >= 128:
+        low, high = 1.6, 2.8
+    else:
+        _sleep_poll_delay()
+        return
+    time.sleep(random.uniform(low, high))
+
+
+def _initial_worker_jitter(worker_slot: int) -> None:
+    workers = max(1, int(_worker_count_hint or 1))
+    if workers < 128:
+        return
+    override = str(os.environ.get("INITIAL_WORKER_JITTER_SPREAD", "") or "").strip()
+    if override:
+        try:
+            spread = max(0.0, float(override))
+        except Exception:
+            spread = 0.0
+    elif workers >= 1024:
+        spread = 1.5
+    elif workers >= 512:
+        spread = 1.0
+    elif workers >= 256:
+        spread = 0.8
+    else:
+        spread = 0.5
+    base = ((max(1, int(worker_slot)) - 1) % workers) / max(1, workers - 1)
+    delay = base * spread + random.uniform(0.0, min(1.5, spread / 8.0))
+    if delay > 0:
+        time.sleep(delay)
+
+
+def _poll_progress_enabled() -> bool:
+    return _worker_count_hint <= 32
+
+
+def _poll_progress_tick() -> None:
+    if _poll_progress_enabled():
+        print(".", end="", flush=True)
 
 
 def _sentinel_js_date_string() -> str:
@@ -806,19 +1284,119 @@ def _browser_proxy_url(proxy_url: str) -> str:
     return raw
 
 
+def _sentinel_worker_call(mode: str, payload: Optional[Dict[str, Any]] = None, *, timeout: float = 20.0) -> Dict[str, Any]:
+    global _sentinel_worker_process
+    probe_path = os.path.join(SENTINEL_SUPPORT_DIR, "sentinel_node_vm_probe.js")
+    if not os.path.exists(probe_path):
+        return {}
+    request = {
+        "mode": str(mode or "").strip(),
+        "payload": payload or {},
+        "request_id": secrets.token_hex(8),
+    }
+    encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
+    with _sentinel_worker_lock:
+        proc = _sentinel_worker_process
+        if proc is None or proc.poll() is not None:
+            try:
+                proc = subprocess.Popen(
+                    ["node", probe_path, "serve"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    cwd=SCRIPT_DIR,
+                    bufsize=1,
+                )
+            except Exception:
+                _sentinel_worker_process = None
+                return {}
+            _sentinel_worker_process = proc
+        try:
+            assert proc.stdin is not None and proc.stdout is not None
+            proc.stdin.write(encoded + "\n")
+            proc.stdin.flush()
+            deadline = time.time() + max(1.0, float(timeout or 20.0))
+            while time.time() < deadline:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                line = str(line or "").strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+                if str(data.get("request_id") or "") != request["request_id"]:
+                    continue
+                if isinstance(data.get("result"), dict):
+                    return data["result"]
+                return {}
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        _sentinel_worker_process = None
+        return {}
+
+
+def _prune_ttl_cache(cache: Dict[str, Dict[str, Any]], now: Optional[float] = None, *, max_entries: int = 1024) -> None:
+    if len(cache) <= max_entries:
+        return
+    current_ts = time.time() if now is None else float(now)
+    expired_keys = [
+        key for key, value in cache.items()
+        if float((value or {}).get("expires_at_ts") or 0.0) <= current_ts
+    ]
+    for key in expired_keys:
+        cache.pop(key, None)
+    if len(cache) <= max_entries:
+        return
+    overflow = len(cache) - max_entries
+    for key in list(cache.keys())[:overflow]:
+        cache.pop(key, None)
+
+
+def _browser_sentinel_auth_url() -> str:
+    try:
+        oauth = generate_oauth_url(prompt="login")
+        auth_url = str(getattr(oauth, "auth_url", "") or "").strip()
+        if auth_url:
+            return auth_url
+    except Exception:
+        pass
+    return "https://auth.openai.com/log-in"
+
+
+def _browser_sentinel_flow_url(flow: str) -> str:
+    normalized = str(flow or "").strip()
+    if normalized in {
+        SENTINEL_FLOW_SIGNUP_EMAIL,
+        SENTINEL_FLOW_CREATE_PASSWORD,
+        SENTINEL_FLOW_EMAIL_OTP,
+        SENTINEL_FLOW_ABOUT_YOU,
+    }:
+        return "https://auth.openai.com/create-account"
+    if normalized == SENTINEL_FLOW_PASSWORD_VERIFY:
+        return "https://auth.openai.com/log-in/password"
+    return _browser_sentinel_auth_url()
+
+
 def _fetch_sentinel_sdk_token(
     *,
     flow: str,
     user_agent: str,
     proxy_url: str = "",
+    did: str = "",
 ) -> str:
-    node_cmd = _find_node_executable()
-    if not _browser_mode:
-        return ""
     if flow not in _SENTINEL_SDK_SUPPORTED_FLOWS:
         return ""
-    if not node_cmd:
-        print("[Warn] sentinel sdk token bridge skipped: node/nodejs not found")
+    if not _browser_mode:
         return ""
     browser_path = _find_sentinel_browser_executable()
     if not browser_path:
@@ -849,6 +1427,8 @@ const executablePath = process.argv[1];
 const proxyServer = process.argv[2];
 const flow = process.argv[3];
 const userAgent = process.argv[4];
+const did = process.argv[5];
+const authUrl = process.argv[6];
 
 (async() => {
   const launchOptions = {
@@ -857,9 +1437,15 @@ const userAgent = process.argv[4];
   };
   if (proxyServer) launchOptions.proxy = { server: proxyServer };
   const browser = await chromium.launch(launchOptions);
-  const page = await browser.newPage({ userAgent });
-  await page.goto('https://sentinel.openai.com/backend-api/sentinel/frame.html', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.addScriptTag({ url: 'https://sentinel.openai.com/backend-api/sentinel/sdk.js' });
+  const context = await browser.newContext({ userAgent, locale: 'en-US' });
+  if (did) {
+    await context.addCookies([
+      { name: 'oai-did', value: did, domain: 'auth.openai.com', path: '/', secure: true, httpOnly: false, sameSite: 'Lax' },
+      { name: 'oai-did', value: did, domain: 'sentinel.openai.com', path: '/', secure: true, httpOnly: false, sameSite: 'Lax' },
+    ]);
+  }
+  const page = await context.newPage();
+  await page.goto(authUrl || 'https://auth.openai.com/log-in', { waitUntil: 'domcontentloaded', timeout: 90000 });
   await page.waitForFunction(() => window.SentinelSDK && typeof window.SentinelSDK.token === 'function', null, { timeout: 60000 });
   const token = await page.evaluate(async (flowName) => {
     const withTimeout = (promise, ms) => Promise.race([
@@ -879,13 +1465,15 @@ const userAgent = process.argv[4];
     try:
         result = subprocess.run(
             [
-                node_cmd,
+                "node",
                 "-e",
                 node_script,
                 browser_path,
                 browser_proxy,
                 flow,
                 user_agent,
+                str(did or ""),
+                _browser_sentinel_auth_url(),
             ],
             capture_output=True,
             text=True,
@@ -905,11 +1493,22 @@ const userAgent = process.argv[4];
         if err:
             print(f"[Warn] sentinel sdk token bridge error: {err[:300]}")
         return ""
+    try:
+        payload = json.loads(token)
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    if str(payload.get("flow") or "").strip() != str(flow or "").strip():
+        return ""
+    if did:
+        token_did = str(payload.get("id") or "").strip()
+        if token_did != str(did or "").strip():
+            return ""
     return token
 
 
 def _fetch_sentinel_requirements_token() -> str:
-    node_cmd = _find_node_executable()
     now = time.time()
     with _sentinel_requirements_cache_lock:
         token = str(_sentinel_requirements_cache.get("token") or "").strip()
@@ -917,12 +1516,24 @@ def _fetch_sentinel_requirements_token() -> str:
         if token and expires_at > now + 10:
             return token
 
-    probe_path = os.path.join(SCRIPT_DIR, "sentinel_node_vm_probe.js")
-    if not node_cmd or not os.path.exists(probe_path):
+    worker_result = _sentinel_worker_call("requirements", timeout=8.0)
+    token = str((worker_result or {}).get("token") or "").strip()
+    if token:
+        ttl = min(
+            SENTINEL_SDK_CACHE_TTL,
+            max(30, int((worker_result or {}).get("len") and 120 or 120)),
+        )
+        with _sentinel_requirements_cache_lock:
+            _sentinel_requirements_cache["token"] = token
+            _sentinel_requirements_cache["expires_at_ts"] = time.time() + ttl
+        return token
+
+    probe_path = os.path.join(SENTINEL_SUPPORT_DIR, "sentinel_node_vm_probe.js")
+    if not os.path.exists(probe_path):
         return ""
     try:
         result = subprocess.run(
-            [node_cmd, probe_path, "requirements"],
+            ["node", probe_path, "requirements"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -964,9 +1575,45 @@ def _transform_turnstile_material(
     req_proof: str,
     req_json: Dict[str, Any],
 ) -> Dict[str, str]:
-    node_cmd = _find_node_executable()
-    probe_path = os.path.join(SCRIPT_DIR, "sentinel_node_vm_probe.js")
-    if not node_cmd or not os.path.exists(probe_path):
+    cache_seed = json.dumps(
+        {
+            "req_proof": str(req_proof or ""),
+            "token": str((req_json or {}).get("token") or ""),
+            "dx": str((((req_json or {}).get("turnstile") or {}).get("dx") or "")),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cache_key = hashlib.sha1(cache_seed.encode("utf-8", "ignore")).hexdigest()
+    now = time.time()
+    with _sentinel_transform_cache_lock:
+        cached = _sentinel_transform_cache.get(cache_key) or {}
+        if cached and float(cached.get("expires_at_ts") or 0.0) > now:
+            return dict(cached.get("value") or {})
+
+    worker_result = _sentinel_worker_call(
+        "transform",
+        {"req_proof": str(req_proof or ""), "req_json": req_json or {}},
+        timeout=10.0,
+    )
+    if isinstance(worker_result, dict) and (
+        str(worker_result.get("t") or "").strip() or str(worker_result.get("enforcement") or "").strip()
+    ):
+        value = {
+            "t": str((worker_result or {}).get("t") or "").strip(),
+            "p": str((worker_result or {}).get("enforcement") or "").strip(),
+        }
+        with _sentinel_transform_cache_lock:
+            _prune_ttl_cache(_sentinel_transform_cache, max_entries=2048)
+            _sentinel_transform_cache[cache_key] = {
+                "expires_at_ts": time.time() + 30,
+                "value": value,
+            }
+        return value
+
+    probe_path = os.path.join(SENTINEL_SUPPORT_DIR, "sentinel_node_vm_probe.js")
+    if not os.path.exists(probe_path):
         return {}
 
     temp_path = ""
@@ -990,7 +1637,7 @@ def _transform_turnstile_material(
             temp_path = f.name
 
         result = subprocess.run(
-            [node_cmd, probe_path, "transform", temp_path],
+            ["node", probe_path, "transform", temp_path],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1033,6 +1680,138 @@ def _transform_turnstile_material(
     return {"t": t_val, "p": p_val}
 
 
+def _build_sentinel_exact_token(
+    *,
+    did: str,
+    flow: str,
+    req_proof: str,
+    req_json: Dict[str, Any],
+) -> str:
+    cache_seed = json.dumps(
+        {
+            "did": str(did or ""),
+            "flow": str(flow or ""),
+            "req_proof": str(req_proof or ""),
+            "token": str((req_json or {}).get("token") or ""),
+            "dx": str((((req_json or {}).get("turnstile") or {}).get("dx") or "")),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cache_key = hashlib.sha1(cache_seed.encode("utf-8", "ignore")).hexdigest()
+    now = time.time()
+    with _sentinel_exact_cache_lock:
+        cached = _sentinel_exact_cache.get(cache_key) or {}
+        if cached and float(cached.get("expires_at_ts") or 0.0) > now:
+            return str(cached.get("value") or "")
+
+    worker_result = _sentinel_worker_call(
+        "exact",
+        {
+            "did": str(did or ""),
+            "flow": str(flow or ""),
+            "req_proof": str(req_proof or ""),
+            "req_json": req_json or {},
+        },
+        timeout=10.0,
+    )
+    exact = str((worker_result or {}).get("exact") or "").strip()
+    if exact:
+        try:
+            decoded = json.loads(exact)
+        except Exception:
+            decoded = {}
+        if (
+            isinstance(decoded, dict)
+            and str(decoded.get("id") or "").strip() == str(did or "").strip()
+            and str(decoded.get("flow") or "").strip() == str(flow or "").strip()
+            and str(decoded.get("c") or "").strip()
+        ):
+            with _sentinel_exact_cache_lock:
+                _prune_ttl_cache(_sentinel_exact_cache, max_entries=2048)
+                _sentinel_exact_cache[cache_key] = {
+                    "expires_at_ts": time.time() + 30,
+                    "value": exact,
+                }
+            return exact
+
+    probe_path = os.path.join(SENTINEL_SUPPORT_DIR, "sentinel_node_vm_probe.js")
+    if not os.path.exists(probe_path):
+        return ""
+
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            suffix=".json",
+            delete=False,
+            dir=SCRIPT_DIR,
+        ) as f:
+            json.dump(
+                {
+                    "did": str(did or ""),
+                    "flow": str(flow or ""),
+                    "req_proof": str(req_proof or ""),
+                    "req_json": req_json or {},
+                },
+                f,
+                ensure_ascii=False,
+            )
+            temp_path = f.name
+
+        result = subprocess.run(
+            ["node", probe_path, "exact", temp_path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=SCRIPT_DIR,
+            timeout=90,
+            check=False,
+        )
+    except Exception as e:
+        print(f"[Warn] sentinel exact token bridge failed: {e}")
+        return ""
+    finally:
+        try:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+    if result.returncode != 0:
+        err = (result.stderr or "").strip()
+        if err:
+            print(f"[Warn] sentinel exact token error: {err[:300]}")
+        return ""
+
+    try:
+        payload = json.loads((result.stdout or "").strip() or "{}")
+    except Exception as e:
+        print(f"[Warn] sentinel exact token json decode failed: {e}")
+        return ""
+
+    exact = str((payload or {}).get("exact") or "").strip()
+    if not exact:
+        return ""
+    try:
+        decoded = json.loads(exact)
+    except Exception:
+        return ""
+    if not isinstance(decoded, dict):
+        return ""
+    if str(decoded.get("id") or "").strip() != str(did or "").strip():
+        return ""
+    if str(decoded.get("flow") or "").strip() != str(flow or "").strip():
+        return ""
+    if not str(decoded.get("c") or "").strip():
+        return ""
+    return exact
+
+
 def _build_sentinel_fallback_token(
     *,
     did: str,
@@ -1042,12 +1821,20 @@ def _build_sentinel_fallback_token(
 ) -> str:
     c_token = str((req_json or {}).get("token") or "").strip()
     turnstile = (req_json or {}).get("turnstile") or {}
+    req_proof = str((req_json or {}).get("_requirements_token") or "").strip()
+    if not req_proof:
+        req_proof = _fetch_sentinel_requirements_token()
+    exact_token = _build_sentinel_exact_token(
+        did=did,
+        flow=flow,
+        req_proof=req_proof,
+        req_json=req_json,
+    )
+    if exact_token:
+        return exact_token
     t_val = ""
     if isinstance(turnstile, dict):
         dx = str(turnstile.get("dx") or "").strip()
-        req_proof = str((req_json or {}).get("_requirements_token") or "").strip()
-        if not req_proof:
-            req_proof = _fetch_sentinel_requirements_token()
         if dx and req_proof:
             material = _transform_turnstile_material(req_proof=req_proof, req_json=req_json)
             t_val = str((material or {}).get("t") or "").strip()
@@ -1061,7 +1848,8 @@ def _build_sentinel_fallback_token(
     else:
         p_val = _build_sentinel_pow_token(req_json, user_agent) or ""
     return json.dumps(
-        {"p": p_val, "t": t_val, "c": c_token, "id": did, "flow": flow}
+        {"p": p_val, "t": t_val, "c": c_token, "id": did, "flow": flow},
+        separators=(",", ":"),
     )
 
 
@@ -1219,21 +2007,7 @@ def _mode_stats_entry(
 
 
 def _load_domain_blacklist() -> set:
-    global _domain_blacklist_cache
-    if _no_blacklist_mode:
-        return set()
-    with _domain_blacklist_lock:
-        if _domain_blacklist_cache is None:
-            loaded = set()
-            for path in (DOMAIN_BLACKLIST_FILE, RUNTIME_DOMAIN_BLACKLIST_FILE):
-                if os.path.exists(path):
-                    with open(path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            domain = _extract_email_domain(line)
-                            if domain:
-                                loaded.add(domain)
-            _domain_blacklist_cache = loaded
-        return set(_domain_blacklist_cache)
+    return set()
 
 
 def _read_domain_quarantine_file() -> Dict[str, Any]:
@@ -1281,14 +2055,7 @@ def _save_domain_quarantine_locked() -> None:
 
 
 def _load_domain_quarantine() -> Dict[str, Any]:
-    global _domain_quarantine_cache
-    if _no_blacklist_mode:
-        return {}
-    with _domain_quarantine_lock:
-        if _domain_quarantine_cache is None:
-            _domain_quarantine_cache = _cleanup_domain_quarantine_entries(_read_domain_quarantine_file())
-            _save_domain_quarantine_locked()
-        return json.loads(json.dumps(_domain_quarantine_cache))
+    return {}
 
 
 def _quarantine_mode_entry(
@@ -1319,43 +2086,15 @@ def _quarantine_mode_entry(
 
 
 def _is_domain_quarantined(email_or_domain: str, mode_key: Optional[str] = None) -> bool:
-    domain = _extract_email_domain(email_or_domain)
-    if not domain:
-        return False
-    data = _load_domain_quarantine()
-    entry = data.get(domain)
-    if not isinstance(entry, dict):
-        return False
-    by_mode = entry.get("by_mode")
-    if not isinstance(by_mode, dict):
-        return False
-    current = by_mode.get(_stats_mode_key(mode_key))
-    if not isinstance(current, dict):
-        return False
-    last_seen = int(current.get("last_seen") or 0)
-    escalated = bool(current.get("escalated"))
-    if escalated:
-        return False
-    if not last_seen:
-        return False
-    return (int(time.time()) - last_seen) <= FAILED_CREATE_QUARANTINE_TTL_SECONDS
+    return False
 
 
 def _domain_unavailable_reason(email_or_domain: str, mode_key: Optional[str] = None) -> str:
-    if _no_blacklist_mode:
-        return ""
-    if _is_domain_blacklisted(email_or_domain):
-        return "blacklisted"
-    if _is_domain_quarantined(email_or_domain, mode_key=mode_key):
-        return "quarantined"
     return ""
 
 
 def _is_domain_blacklisted(email_or_domain: str) -> bool:
-    domain = _extract_email_domain(email_or_domain)
-    if not domain:
-        return False
-    return domain in _load_domain_blacklist()
+    return False
 
 
 def _filter_blacklisted_domains(domains: List[str]) -> List[str]:
@@ -1550,80 +2289,18 @@ def _prioritize_domains(domains: List[str]) -> List[str]:
 
 
 def _pick_domain(domains: List[str]) -> str:
-    ranked = _prioritize_domains(domains)
-    if not ranked:
+    candidates = [domain for domain in domains if domain]
+    if not candidates:
         return ""
-    floor = min(_domain_score(domain) for domain in ranked)
-    weighted_domains: List[str] = []
-    weights: List[float] = []
-    for index, domain in enumerate(ranked):
-        score = _domain_score(domain)
-        # Keep lower-ranked families possible, but no longer equally likely.
-        weight = max(1.0, float(score - floor + 3))
-        weight /= 1.0 + index * 0.22
-        weighted_domains.append(domain)
-        weights.append(weight)
-    return random.choices(weighted_domains, weights=weights, k=1)[0]
+    return random.choice(candidates)
 
 
 def _should_skip_low_score_domain(email_or_domain: str) -> bool:
-    family = _domain_family(email_or_domain)
-    if not family:
-        return False
-
-    entry = _load_domain_stats().get(family) or {}
-    active_mode = _stats_mode_key()
-    stats = _mode_stats_entry(entry, mode_key=active_mode) or {}
-    success = int(stats.get("success") or 0) + int(_load_historical_success_counts(mode_key=active_mode).get(family) or 0)
-    phone_required = int(stats.get("phone_required") or 0)
-    failed_to_create = int(stats.get("failed_to_create_account") or 0)
-    registration_disallowed = int(stats.get("registration_disallowed") or 0)
-    blacklist = int(stats.get("blacklist") or 0)
-    unsupported = int(stats.get("unsupported_email") or 0)
-
-    if success > 0:
-        return False
-    if blacklist > 0 or unsupported > 0:
-        return True
-    if registration_disallowed >= 1:
-        return True
-    if failed_to_create >= 3:
-        return True
-    if phone_required >= 12:
-        return True
     return False
 
 
 def _should_temporarily_avoid_domain(email_or_domain: str) -> bool:
-    family = _domain_family(email_or_domain)
-    if not family:
-        return False
-    if _experiment2_enabled and family == _experiment2_force_family:
-        return False
-    if family in set(_preferred_domain_families(limit=4, score_window=80)):
-        return False
-
-    entry = _load_domain_stats().get(family) or {}
-    active_mode = _stats_mode_key()
-    stats = _mode_stats_entry(entry, mode_key=active_mode) or {}
-    success = int(stats.get("success") or 0) + int(_load_historical_success_counts(mode_key=active_mode).get(family) or 0)
-    phone_required = int(stats.get("phone_required") or 0)
-    if phone_required < 18:
-        return False
-    if success >= 6 and phone_required < success * 4:
-        return False
-
-    pressure = phone_required / max(1, success + 1)
-    if pressure < 4.0:
-        return False
-
-    chance = 0.18 + min(0.30, (pressure - 4.0) * 0.10)
-    last_outcome = str(stats.get("last_outcome") or "").strip().lower()
-    updated_at = int(stats.get("updated_at") or 0)
-    if last_outcome == "phone_required" and updated_at and (time.time() - updated_at) < 1800:
-        chance += 0.12
-    chance = min(0.68, chance)
-    return random.random() < chance
+    return False
 
 
 def _preferred_domain_families(limit: int = 4, score_window: int = 80) -> List[str]:
@@ -1817,22 +2494,25 @@ def _raise_if_blacklistable_email_error(resp: Any, email: str, *, stage: str = "
 
 
 def _candidate_proxy_urls(proxy: Optional[str]) -> List[str]:
-    if proxy is None:
-        raw = DEFAULT_V2RAYN_PROXY
-    else:
-        raw = str(proxy).strip()
+    raw = "" if proxy is None else str(proxy).strip()
+
+    def _localhost_candidates(host: str = "127.0.0.1") -> List[str]:
+        candidates: List[str] = []
+        for port in DEFAULT_PROXY_PORT_CANDIDATES:
+            for scheme in ("socks5h", "socks5", "http"):
+                candidates.append(f"{scheme}://{host}:{port}")
+        return _dedupe_keep_order(candidates)
 
     if not raw:
-        return []
+        return _localhost_candidates("127.0.0.1")
 
     lowered = raw.lower()
     if lowered == "auto":
-        candidates: List[str] = []
-        for port in DEFAULT_PROXY_PORT_CANDIDATES:
-            candidates.extend(_candidate_proxy_urls(port))
-        return _dedupe_keep_order(candidates)
+        return _localhost_candidates("127.0.0.1")
     if lowered in _PROXY_DIRECT_VALUES:
         return []
+    if lowered in {"127.0.0.1", "localhost"}:
+        return _localhost_candidates(lowered)
 
     if "://" in raw:
         parsed = urlparse(raw)
@@ -1893,8 +2573,7 @@ def _normalize_proxy_url(proxy: Optional[str]) -> Optional[str]:
 
     lowered = raw.lower()
     if lowered == "auto":
-        raw = DEFAULT_V2RAYN_PROXY
-        lowered = raw.lower()
+        return None
     if lowered in _PROXY_DIRECT_VALUES:
         return None
     if "://" in raw:
@@ -1980,6 +2659,17 @@ def _token_payload_or_empty(token_json: str) -> Dict[str, Any]:
         return {}
 
 
+def _token_output_base_dir(default_base_dir: str) -> str:
+    override = str(os.environ.get("TOKEN_OUTPUT_DIR", "") or "").strip()
+    if not override:
+        return default_base_dir
+    try:
+        os.makedirs(override, exist_ok=True)
+        return override
+    except Exception:
+        return default_base_dir
+
+
 def _is_experiment_token_payload(payload: Dict[str, Any]) -> bool:
     token_type = str(payload.get("type") or "").strip().lower()
     return token_type == "chatgpt_experiment"
@@ -2015,6 +2705,7 @@ def _token_export_filename(email: str) -> str:
 def _persist_token_artifacts(
     base_dir: str, token_json: str, file_lock: threading.Lock
 ) -> Dict[str, str]:
+    base_dir = _token_output_base_dir(base_dir)
     payload = _token_payload_or_empty(token_json)
     source_is_experiment = _is_experiment_token_payload(payload)
     was_local_promotion = False
@@ -2193,6 +2884,7 @@ def _move_file_with_unique_name(src_path: str, dst_dir: str) -> str:
 
 
 def _repair_token_exports(base_dir: str) -> Dict[str, int]:
+    base_dir = _token_output_base_dir(base_dir)
     tokens_dir = os.path.join(base_dir, "tokens")
     experiment_dir = os.path.join(base_dir, "tokens_experiment")
     ak_path = os.path.join(base_dir, "ak.txt")
@@ -2599,7 +3291,16 @@ def _dropmail_graphql(
         first = errors[0] if isinstance(errors, list) and errors else {}
         if isinstance(first, dict):
             message = str(first.get("message") or "DropMail graphql error").strip()
+            extensions = first.get("extensions") or {}
+            code = str((extensions or {}).get("code") or "").strip().upper()
             lowered = message.lower()
+            result = data.get("data")
+            if code == "LEGACY_TOKEN_DEPRECATED" and isinstance(result, dict):
+                print(f"[*] DropMail graphql warning: {message}")
+                return result
+            if code == "CORRUPTED_TOKEN" or "corrupted" in lowered:
+                _dropmail_clear_api_token()
+                raise DropMailAuthError(message or "DropMail graphql corrupted_token")
             if "unauthorized" in lowered or ("invalid" in lowered and "token" in lowered):
                 _dropmail_clear_api_token()
                 raise DropMailAuthError(message or "DropMail graphql unauthorized")
@@ -2672,7 +3373,7 @@ def _dropmail_message_content(message: Dict[str, Any]) -> str:
 
 
 def _dropmail_create_mailbox(token: str, proxies: Any = None) -> tuple:
-    with _dropmail_mailbox_slots:
+    if True:
         token = str(token or "").strip()
         if not token:
             raise RuntimeError("DropMail token missing")
@@ -3111,6 +3812,770 @@ def _try_skymail(proxies: Any) -> tuple:
         return "", ""
 
 
+def _try_skymail_forced(proxies: Any) -> tuple:
+    max_attempts = max(6, DEFAULT_EMAIL_SOURCE_ROUNDS * 3)
+    for attempt in range(1, max_attempts + 1):
+        email, token = _try_skymail(proxies)
+        if email and token:
+            return email, token
+        wait_seconds = random.uniform(1.2, 3.5)
+        print(
+            f"[*] skymail forced retry {attempt}/{max_attempts}; "
+            f"sleep {wait_seconds:.1f}s"
+        )
+        time.sleep(wait_seconds)
+    return "", ""
+
+
+def _custom_random_mailbox() -> str:
+    local_len = random.randint(8, 14)
+    local = "".join(random.choices(string.ascii_lowercase + string.digits, k=local_len))
+    # Keep domains random, but bias toward the subdomain shapes that have
+    # historically produced more consent_path hits on the 114514.tv catch-all.
+    lens = random.choices(
+        population=[
+            (6,),
+            (4,),
+            (6, 3),
+            (4, 3),
+            (5, 4),
+            (5,),
+            (5, 3),
+        ],
+        weights=[76, 10, 6, 4, 2, 1, 1],
+        k=1,
+    )[0]
+    labels = []
+    for label_len in lens:
+        labels.append("".join(random.choices(string.ascii_lowercase + string.digits, k=int(label_len))))
+    domain = ".".join(labels + [CUSTOM_MAIL_ROOT_DOMAIN])
+    return f"{local}@{domain}"
+
+
+def _custom_http_login(*, force_refresh: bool = False) -> std_requests.Session:
+    global _custom_http_shared_session, _custom_http_shared_created_at
+    now = time.time()
+    with _custom_http_shared_session_lock:
+        session = _custom_http_shared_session
+        if (
+            not force_refresh
+            and session is not None
+            and (now - float(_custom_http_shared_created_at or 0.0)) < 30 * 60
+        ):
+            return session
+        try:
+            if session is not None:
+                session.close()
+        except Exception:
+            pass
+        session = std_requests.Session()
+        session.trust_env = False
+        adapter = std_requests.adapters.HTTPAdapter(
+            pool_connections=256,
+            pool_maxsize=256,
+            max_retries=0,
+            pool_block=False,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/146.0.7680.178 Safari/537.36"
+                ),
+                "Accept": "application/json",
+                "Connection": "keep-alive",
+                "X-API-Key": CUSTOM_MAIL_API_KEY,
+            }
+        )
+        _custom_http_shared_session = session
+        _custom_http_shared_created_at = now
+        return session
+
+
+def _custom_http_timeout_tuple() -> Tuple[float, float]:
+    connect_timeout = max(1.0, float(CUSTOM_MAIL_CONNECT_TIMEOUT or 4.0))
+    read_timeout = max(connect_timeout, float(CUSTOM_MAIL_READ_TIMEOUT or 6.0))
+    return (connect_timeout, read_timeout)
+
+
+def _custom_cache_get(mailbox_email: str) -> Optional[List[Dict[str, Any]]]:
+    mailbox_key = str(mailbox_email or "").strip().lower()
+    if not mailbox_key:
+        return None
+    now = time.time()
+    with _custom_http_cache_lock:
+        cached = _custom_http_cache.get(mailbox_key)
+        if not isinstance(cached, dict):
+            return None
+        expires_at = float(cached.get("expires_at") or 0.0)
+        if expires_at <= now:
+            _custom_http_cache.pop(mailbox_key, None)
+            return None
+        messages = cached.get("messages")
+        if not isinstance(messages, list):
+            return None
+        return [dict(item) for item in messages if isinstance(item, dict)]
+
+
+def _custom_cache_set(mailbox_email: str, messages: List[Dict[str, Any]], *, found: bool) -> None:
+    mailbox_key = str(mailbox_email or "").strip().lower()
+    if not mailbox_key:
+        return
+    ttl = CUSTOM_MAIL_RESULT_CACHE_TTL if found else CUSTOM_MAIL_NEGATIVE_CACHE_TTL
+    payload = [dict(item) for item in (messages or []) if isinstance(item, dict)]
+    with _custom_http_cache_lock:
+        _custom_http_cache[mailbox_key] = {
+            "expires_at": time.time() + max(0.1, float(ttl or 0.1)),
+            "messages": payload,
+        }
+
+
+def _custom_http_get_json(
+    session: std_requests.Session,
+    path: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    accept_statuses: Optional[set] = None,
+) -> Tuple[int, Any]:
+    accept = set(accept_statuses or {200})
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max(1, int(CUSTOM_MAIL_HTTP_RETRIES or 1)) + 1):
+        try:
+            with _custom_http_slot():
+                resp = session.get(
+                    f"{CUSTOM_MAIL_API_BASE}{path}",
+                    params=params,
+                    timeout=_custom_http_timeout_tuple(),
+                )
+            status = int(resp.status_code or 0)
+            if status in accept:
+                if status == 204 or not str(resp.text or "").strip():
+                    return status, {}
+                return status, resp.json()
+            if status in {404, 204}:
+                return status, {}
+            raise RuntimeError(f"custom api {path} http {status}")
+        except (std_requests.exceptions.Timeout, std_requests.exceptions.ConnectionError) as exc:
+            last_error = exc
+            if attempt >= max(1, int(CUSTOM_MAIL_HTTP_RETRIES or 1)):
+                raise
+            time.sleep(min(0.8, 0.15 * attempt + random.uniform(0.02, 0.12)))
+    if last_error is not None:
+        raise last_error
+    return 0, {}
+
+
+def _custom_http_post_json(
+    session: std_requests.Session,
+    path: str,
+    *,
+    json_body: Optional[Dict[str, Any]] = None,
+    accept_statuses: Optional[set] = None,
+) -> Tuple[int, Any]:
+    accept = set(accept_statuses or {200})
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max(1, int(CUSTOM_MAIL_HTTP_RETRIES or 1)) + 1):
+        try:
+            with _custom_http_slot():
+                resp = session.post(
+                    f"{CUSTOM_MAIL_API_BASE}{path}",
+                    json=json_body or {},
+                    timeout=_custom_http_timeout_tuple(),
+                )
+            status = int(resp.status_code or 0)
+            if status in accept:
+                if status == 204 or not str(resp.text or "").strip():
+                    return status, {}
+                return status, resp.json()
+            if status in {404, 204}:
+                return status, {}
+            raise RuntimeError(f"custom api {path} http {status}")
+        except (std_requests.exceptions.Timeout, std_requests.exceptions.ConnectionError) as exc:
+            last_error = exc
+            if attempt >= max(1, int(CUSTOM_MAIL_HTTP_RETRIES or 1)):
+                raise
+            time.sleep(min(0.8, 0.15 * attempt + random.uniform(0.02, 0.12)))
+    if last_error is not None:
+        raise last_error
+    return 0, {}
+
+
+def _custom_imap_fetch_recent_messages(*, mailbox_email: str, limit: int = CUSTOM_MAIL_POLL_MAX_MESSAGES) -> List[Dict[str, Any]]:
+    mailbox_email = str(mailbox_email or "").strip().lower()
+    if not mailbox_email:
+        return []
+    try:
+        conn = imaplib.IMAP4_SSL(CUSTOM_MAIL_IMAP_HOST, CUSTOM_MAIL_IMAP_PORT)
+        conn.login(CUSTOM_MAIL_IMAP_USER, CUSTOM_MAIL_IMAP_PASSWORD)
+        conn.select("INBOX")
+        status, data = conn.search(None, "HEADER", "TO", mailbox_email)
+        if status != "OK" or not data or not data[0]:
+            status, data = conn.search(None, "ALL")
+        if status != "OK" or not data or not data[0]:
+            conn.logout()
+            return []
+        ids = data[0].split()[-max(8, min(30, int(limit or 8) * 2)):]
+        results: List[Dict[str, Any]] = []
+        for raw_id in reversed(ids):
+            status, fetched = conn.fetch(raw_id, "(RFC822)")
+            if status != "OK" or not fetched or not isinstance(fetched[0], tuple):
+                continue
+            raw_msg = fetched[0][1]
+            if not raw_msg:
+                continue
+            parsed = BytesParser(policy=policy.default).parsebytes(raw_msg)
+            recipients = [str(v).strip().lower() for v in parsed.get_all("to", [])]
+            content = "\n".join(
+                [
+                    str(parsed.get("subject") or ""),
+                    str(parsed.get_body(preferencelist=("plain", "html")).get_content() if parsed.get_body(preferencelist=("plain", "html")) else ""),
+                ]
+            )
+            if mailbox_email and mailbox_email not in ",".join(recipients).lower():
+                continue
+            results.append(
+                {
+                    "id": f"custom-imap:{raw_id.decode('utf-8', 'ignore')}",
+                    "to": mailbox_email,
+                    "from": str(parsed.get("from") or ""),
+                    "subject": str(parsed.get("subject") or ""),
+                    "text": content,
+                    "date": str(parsed.get("date") or ""),
+                    "uid": raw_id.decode("utf-8", "ignore"),
+                }
+            )
+            if len(results) >= max(1, int(limit or CUSTOM_MAIL_POLL_MAX_MESSAGES)):
+                break
+        conn.logout()
+        return results
+    except Exception:
+        return []
+
+
+def _custom_extract_otp_payload(payload: Dict[str, Any], mailbox_email: str) -> List[Dict[str, Any]]:
+    mailbox_email = str(mailbox_email or "").strip().lower()
+    candidates: List[Dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        return candidates
+
+    def _append_item(item: Dict[str, Any]) -> None:
+        if not isinstance(item, dict):
+            return
+        recipients = item.get("recipients")
+        if isinstance(recipients, list):
+            recipient_values = [str(v or "").strip().lower() for v in recipients]
+        else:
+            _update_run_context(
+                last_branch_result=f"pwd_non_otp:{pwd_page_type or '<none>'}",
+            )
+            recipient_values = []
+        primary = str(item.get("primary_address") or item.get("to") or "").strip().lower()
+        if mailbox_email and recipient_values and mailbox_email not in recipient_values and primary != mailbox_email:
+            return
+        subject = str(item.get("subject") or "")
+        snippet = str(item.get("snippet") or "")
+        text_body = str(item.get("text_body") or item.get("text") or "")
+        html_body = str(item.get("html_body") or item.get("html") or "")
+        content = "\n".join([subject, snippet, text_body, html_body])
+        otp_code = str(item.get("otp_code") or "").strip()
+        is_verification = bool(item.get("verification"))
+        if not otp_code:
+            match = re.search(r"(?<!\d)(\d{6})(?!\d)", content)
+            otp_code = str(match.group(1) or "").strip() if match else ""
+        if not is_verification and "openai" not in content.lower() and not otp_code:
+            return
+        uid = str(item.get("uid") or item.get("id") or "").strip()
+        candidates.append(
+            {
+                "id": f"custom:{uid or hashlib.sha1(content.encode('utf-8', 'ignore')).hexdigest()}",
+                "to": primary or ", ".join(recipient_values),
+                "from": str(item.get("from") or ""),
+                "subject": subject,
+                "text": content,
+                "date": str(item.get("date") or item.get("created_at") or ""),
+                "uid": uid,
+                "otp_code": otp_code,
+            }
+        )
+
+    latest = payload.get("item")
+    if isinstance(latest, dict):
+        _append_item(latest)
+    latest = payload.get("message")
+    if isinstance(latest, dict):
+        _append_item(latest)
+    latest = payload.get("data")
+    if isinstance(latest, dict):
+        _append_item(latest)
+    items = payload.get("items")
+    if isinstance(items, list):
+        for item in items:
+            _append_item(item)
+    return candidates
+
+
+def _custom_global_message_index_snapshot() -> Dict[str, List[Dict[str, Any]]]:
+    workers = max(1, int(_worker_count_hint or 1))
+    if workers < 256:
+        return {}
+    now = time.time()
+    with _custom_global_poll_lock:
+        expires_at = float(globals().get("_custom_global_poll_expires_at") or 0.0)
+        current_map = globals().get("_custom_global_poll_by_recipient") or {}
+        if expires_at > now and current_map:
+            return {
+                key: [dict(item) for item in values if isinstance(item, dict)]
+                for key, values in current_map.items()
+            }
+        while bool(globals().get("_custom_global_poll_refreshing")):
+            _custom_global_poll_cv.wait(timeout=0.5)
+            expires_at = float(globals().get("_custom_global_poll_expires_at") or 0.0)
+            current_map = globals().get("_custom_global_poll_by_recipient") or {}
+            if expires_at > time.time() and current_map:
+                return {
+                    key: [dict(item) for item in values if isinstance(item, dict)]
+                    for key, values in current_map.items()
+                }
+        globals()["_custom_global_poll_refreshing"] = True
+    try:
+        session = _custom_http_login()
+        status, data = _custom_http_get_json(
+            session,
+            "/api/messages",
+            params={
+                "limit": max(40, min(int(CUSTOM_MAIL_POLL_MAX_MESSAGES or 12) * 20, 160)),
+            },
+            accept_statuses={200, 204},
+        )
+        items = data.get("items") if isinstance(data, dict) else []
+        parsed = _custom_extract_otp_payload({"items": items if isinstance(items, list) else []}, "")
+        by_recipient: Dict[str, List[Dict[str, Any]]] = {}
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            recipient = str(item.get("to") or "").strip().lower()
+            if not recipient:
+                continue
+            by_recipient.setdefault(recipient, []).append(dict(item))
+        for recipient, values in by_recipient.items():
+            values.sort(
+                key=lambda msg: (
+                    str(msg.get("date") or ""),
+                    str(msg.get("uid") or ""),
+                    str(msg.get("id") or ""),
+                ),
+                reverse=True,
+            )
+            by_recipient[recipient] = values[:8]
+        with _custom_global_poll_lock:
+            globals()["_custom_global_poll_by_recipient"] = by_recipient
+            globals()["_custom_global_poll_expires_at"] = time.time() + 1.2
+            globals()["_custom_global_poll_refreshing"] = False
+            _custom_global_poll_cv.notify_all()
+            return {
+                key: [dict(item) for item in values if isinstance(item, dict)]
+                for key, values in by_recipient.items()
+            }
+    except Exception:
+        with _custom_global_poll_lock:
+            globals()["_custom_global_poll_refreshing"] = False
+            _custom_global_poll_cv.notify_all()
+        return {}
+
+
+def _custom_message_ts(message: Dict[str, Any]) -> float:
+    if not isinstance(message, dict):
+        return 0.0
+    for key in ("date", "created_at", "createdAt", "createTime", "timestamp"):
+        raw = message.get(key)
+        if raw is None or raw == "":
+            continue
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        text = str(raw).strip()
+        if not text:
+            continue
+        if text.isdigit():
+            try:
+                return float(text)
+            except Exception:
+                pass
+        normalized = text.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except Exception:
+            pass
+    return 0.0
+
+
+def _custom_filter_messages_since(messages: List[Dict[str, Any]], created_after_ts: float) -> List[Dict[str, Any]]:
+    if created_after_ts <= 0:
+        return [dict(item) for item in messages if isinstance(item, dict)]
+    cutoff = float(created_after_ts)
+    filtered: List[Dict[str, Any]] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        ts = _custom_message_ts(item)
+        if ts and ts + 1e-6 < cutoff:
+            continue
+        filtered.append(dict(item))
+    return filtered
+
+
+def _custom_parse_token_metadata(token: str, fallback_email: str) -> Tuple[str, float]:
+    raw = str(token or "").strip()
+    mailbox_email = str(fallback_email or "").strip().lower()
+    created_after_ts = 0.0
+    if raw.startswith("custom:"):
+        raw = raw[len("custom:"):].strip()
+    try:
+        if raw.startswith("{"):
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                mailbox_email = str(payload.get("email") or mailbox_email).strip().lower()
+                created_after_ts = float(payload.get("created_at") or 0.0)
+        elif raw:
+            mailbox_email = raw.strip().lower()
+    except Exception:
+        if raw:
+            mailbox_email = raw.strip().lower()
+    return mailbox_email, created_after_ts
+
+
+def _custom_http_wait_otp(
+    *,
+    session: std_requests.Session,
+    mailbox_email: str,
+    after_ts: float = 0.0,
+    timeout_seconds: int = 8,
+) -> List[Dict[str, Any]]:
+    params: Dict[str, Any] = {
+        "recipient": mailbox_email,
+        "timeout": max(1, min(int(timeout_seconds or 8), 60)),
+    }
+    if after_ts > 0:
+        params["after_ts"] = int(after_ts)
+    status, data = _custom_http_get_json(
+        session,
+        "/api/otp/wait",
+        params=params,
+        accept_statuses={200, 404},
+    )
+    if status != 200:
+        return []
+    return _custom_extract_otp_payload(data, mailbox_email)
+
+
+def _custom_batch_register(mailbox_email: str, created_after_ts: float) -> None:
+    recipient = str(mailbox_email or "").strip().lower()
+    if not recipient:
+        return
+    with _custom_batch_watch_lock:
+        existing = float(_custom_batch_watchers.get(recipient) or 0.0)
+        if existing <= 0.0 or (created_after_ts > 0 and created_after_ts < existing):
+            _custom_batch_watchers[recipient] = float(created_after_ts or 0.0)
+        else:
+            _custom_batch_watchers.setdefault(recipient, float(created_after_ts or 0.0))
+
+
+def _custom_batch_unregister(mailbox_email: str) -> None:
+    recipient = str(mailbox_email or "").strip().lower()
+    if not recipient:
+        return
+    with _custom_batch_watch_lock:
+        _custom_batch_watchers.pop(recipient, None)
+        _custom_batch_cache_by_recipient.pop(recipient, None)
+
+
+def _custom_batch_snapshot() -> Dict[str, List[Dict[str, Any]]]:
+    workers = max(1, int(_worker_count_hint or 1))
+    if workers < 256:
+        return {}
+    now = time.time()
+    with _custom_batch_watch_lock:
+        expires_at = float(globals().get("_custom_batch_cache_expires_at") or 0.0)
+        current_map = globals().get("_custom_batch_cache_by_recipient") or {}
+        if expires_at > now and current_map:
+            return {
+                key: [dict(item) for item in values if isinstance(item, dict)]
+                for key, values in current_map.items()
+            }
+        while bool(globals().get("_custom_batch_refreshing")):
+            _custom_batch_watch_cv.wait(timeout=0.5)
+            expires_at = float(globals().get("_custom_batch_cache_expires_at") or 0.0)
+            current_map = globals().get("_custom_batch_cache_by_recipient") or {}
+            if expires_at > time.time() and current_map:
+                return {
+                    key: [dict(item) for item in values if isinstance(item, dict)]
+                    for key, values in current_map.items()
+                }
+        recipients = [key for key in _custom_batch_watchers.keys() if key]
+        created_map = {key: float(value or 0.0) for key, value in _custom_batch_watchers.items() if key}
+        globals()["_custom_batch_refreshing"] = True
+    if not recipients:
+        with _custom_batch_watch_lock:
+            globals()["_custom_batch_refreshing"] = False
+            _custom_batch_watch_cv.notify_all()
+        return {}
+    session = _custom_http_login()
+    result_map: Dict[str, List[Dict[str, Any]]] = {}
+    try:
+        request_items = []
+        for recipient in recipients:
+            item: Dict[str, Any] = {"recipient": recipient}
+            created_after_ts = created_map.get(recipient, 0.0)
+            if created_after_ts > 0:
+                item["after_ts"] = int(created_after_ts)
+            request_items.append(item)
+        status, data = _custom_http_post_json(
+            session,
+            "/api/otp/batch-wait",
+            json_body={
+                "items": request_items,
+                "limit": 3,
+                "timeout": 1,
+            },
+            accept_statuses={200},
+        )
+        if status == 200 and isinstance(data, dict):
+            rows = data.get("items")
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    recipient = str(row.get("recipient") or "").strip().lower()
+                    if not recipient:
+                        continue
+                    parsed: List[Dict[str, Any]] = []
+                    item = row.get("item")
+                    if isinstance(item, dict):
+                        parsed.extend(_custom_extract_otp_payload({"item": item}, recipient))
+                    item_list = row.get("items")
+                    if isinstance(item_list, list):
+                        parsed.extend(_custom_extract_otp_payload({"items": item_list}, recipient))
+                    if not parsed:
+                        continue
+                    filtered = _custom_filter_messages_since(parsed, created_map.get(recipient, 0.0))
+                    if filtered:
+                        result_map[recipient] = filtered[:3]
+        with _custom_batch_watch_lock:
+            globals()["_custom_batch_cache_by_recipient"] = result_map
+            globals()["_custom_batch_cache_expires_at"] = time.time() + max(0.25, _custom_batch_dispatch_interval())
+            globals()["_custom_batch_refreshing"] = False
+            _custom_batch_watch_cv.notify_all()
+            return {
+                key: [dict(item) for item in values if isinstance(item, dict)]
+                for key, values in result_map.items()
+            }
+    except Exception:
+        with _custom_batch_watch_lock:
+            globals()["_custom_batch_refreshing"] = False
+            _custom_batch_watch_cv.notify_all()
+        return {}
+
+
+def _custom_batch_cached_messages(mailbox_email: str) -> List[Dict[str, Any]]:
+    recipient = str(mailbox_email or "").strip().lower()
+    if not recipient:
+        return []
+    now = time.time()
+    with _custom_batch_watch_lock:
+        expires_at = float(globals().get("_custom_batch_cache_expires_at") or 0.0)
+        current_map = globals().get("_custom_batch_cache_by_recipient") or {}
+        if expires_at <= now:
+            return []
+        values = current_map.get(recipient) or []
+        return [dict(item) for item in values if isinstance(item, dict)]
+
+
+def _custom_batch_dispatch_loop() -> None:
+    while not _custom_batch_dispatch_stop_event.is_set():
+        with _custom_batch_watch_lock:
+            has_watchers = bool(_custom_batch_watchers)
+        if not has_watchers:
+            if _custom_batch_dispatch_stop_event.wait(0.25):
+                break
+            continue
+        try:
+            _custom_batch_snapshot()
+        except Exception:
+            pass
+        if _custom_batch_dispatch_stop_event.wait(_custom_batch_dispatch_interval()):
+            break
+
+
+def _custom_parse_token_metadata(token: str, email: str) -> Tuple[str, float]:
+    raw = str(token or "").strip()
+    mailbox_email = str(email or "").strip().lower()
+    created_after_ts = 0.0
+    if raw.startswith("custom:"):
+        raw = raw[len("custom:"):].strip()
+    try:
+        if raw.startswith("{"):
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                mailbox_email = str(payload.get("email") or payload.get("address") or mailbox_email).strip().lower()
+                created_after_ts = float(payload.get("created_at") or payload.get("createdAt") or 0.0)
+        elif raw:
+            mailbox_email = raw.strip().lower()
+    except Exception:
+        mailbox_email = raw.strip().lower() or mailbox_email
+    return mailbox_email, created_after_ts
+
+
+def _custom_http_wait_otp(
+    *,
+    session: std_requests.Session,
+    mailbox_email: str,
+    after_uid: int = 0,
+    after_ts: float = 0.0,
+    timeout_seconds: int = 8,
+) -> List[Dict[str, Any]]:
+    params: Dict[str, Any] = {
+        "recipient": mailbox_email,
+        "timeout": max(1, min(int(timeout_seconds or 8), 60)),
+    }
+    if after_uid > 0:
+        params["after_uid"] = int(after_uid)
+    if after_ts > 0:
+        params["after_ts"] = int(after_ts)
+    status, data = _custom_http_get_json(
+        session,
+        "/api/otp/wait",
+        params=params,
+        accept_statuses={200, 404},
+    )
+    if status != 200:
+        return []
+    return _custom_extract_otp_payload(data, mailbox_email)
+
+
+def _custom_fetch_recent_messages(
+    *,
+    mailbox_email: str,
+    limit: int = CUSTOM_MAIL_POLL_MAX_MESSAGES,
+    created_after_ts: float = 0.0,
+) -> List[Dict[str, Any]]:
+    mailbox_email = str(mailbox_email or "").strip().lower()
+    if not mailbox_email:
+        return []
+    http_error: Optional[Exception] = None
+    imap_error: Optional[Exception] = None
+    try:
+        cached = _custom_cache_get(mailbox_email)
+        if cached is not None:
+            cached = _custom_filter_messages_since(cached, created_after_ts)
+            return cached[: max(1, int(limit or CUSTOM_MAIL_POLL_MAX_MESSAGES))]
+
+        results: List[Dict[str, Any]] = []
+        if CUSTOM_MAIL_IMAP_FALLBACK:
+            try:
+                results = _custom_imap_fetch_recent_messages(
+                    mailbox_email=mailbox_email,
+                    limit=max(1, min(int(limit or 1), 3)),
+                )
+            except Exception as exc:
+                imap_error = exc
+
+        if not results:
+            try:
+                if int(_worker_count_hint or 1) >= 256:
+                    indexed = _custom_global_message_index_snapshot().get(mailbox_email, [])
+                    if indexed:
+                        results = _custom_filter_messages_since(indexed, created_after_ts)[: max(1, int(limit or CUSTOM_MAIL_POLL_MAX_MESSAGES))]
+                session = _custom_http_login()
+                if not results:
+                    status, data = _custom_http_get_json(
+                        session,
+                        "/api/otp/recent",
+                        params={
+                            "recipient": mailbox_email,
+                            "limit": max(3, min(int(limit or CUSTOM_MAIL_POLL_MAX_MESSAGES), 10)),
+                            **({"after_ts": int(created_after_ts)} if created_after_ts > 0 else {}),
+                        },
+                        accept_statuses={200, 204, 404},
+                    )
+                    if status == 200:
+                        matches = _custom_extract_otp_payload(data, mailbox_email)
+                        if matches:
+                            results = _custom_filter_messages_since(matches, created_after_ts)[: max(1, int(limit or CUSTOM_MAIL_POLL_MAX_MESSAGES))]
+                if not results:
+                    status, data = _custom_http_get_json(
+                        session,
+                        "/api/otp/latest",
+                        params={
+                            "recipient": mailbox_email,
+                            **({"after_ts": int(created_after_ts)} if created_after_ts > 0 else {}),
+                        },
+                        accept_statuses={200, 204, 404},
+                    )
+                    if status == 200:
+                        matches = _custom_extract_otp_payload(data, mailbox_email)
+                        if matches:
+                            results = _custom_filter_messages_since(matches, created_after_ts)[: max(1, int(limit or CUSTOM_MAIL_POLL_MAX_MESSAGES))]
+                if not results:
+                    status, data = _custom_http_get_json(
+                        session,
+                        "/api/messages",
+                        params={
+                            "recipient": mailbox_email,
+                            "limit": max(1, min(int(limit or 1), 2)),
+                        },
+                        accept_statuses={200, 204, 404},
+                    )
+                    if status == 200:
+                        items = data.get("items") if isinstance(data, dict) else []
+                        if isinstance(items, list):
+                            for item in items:
+                                if not isinstance(item, dict):
+                                    continue
+                                enriched = _custom_extract_otp_payload(item, mailbox_email)
+                                if enriched:
+                                    results.extend(enriched[:1])
+                                if len(results) >= max(1, int(limit or CUSTOM_MAIL_POLL_MAX_MESSAGES)):
+                                    break
+            except Exception as exc:
+                http_error = exc
+
+        sliced = _custom_filter_messages_since(results, created_after_ts)[: max(1, int(limit or CUSTOM_MAIL_POLL_MAX_MESSAGES))]
+        _custom_cache_set(mailbox_email, sliced, found=bool(sliced))
+        return sliced
+    except Exception as e:
+        _update_run_context(
+            last_branch_result=f"run_exception:{type(e).__name__}",
+        )
+        print(f"[*] Custom mailbox fetch failed: {e}")
+        return []
+    finally:
+        if http_error is not None and not _custom_cache_get(mailbox_email):
+            print(f"[*] Custom HTTP fetch failed: {http_error}")
+        if imap_error is not None and not _custom_cache_get(mailbox_email):
+            print(f"[*] Custom IMAP fetch failed: {imap_error}")
+
+
+def _try_custom_mailbox(proxies: Any = None) -> tuple:
+    try:
+        email_addr = _custom_random_mailbox()
+        if _hot_log_enabled():
+            print(f"[*] Custom 邮箱: {email_addr}")
+        token_payload = json.dumps(
+            {"email": email_addr, "created_at": time.time()},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return email_addr, f"custom:{token_payload}"
+    except Exception as e:
+        print(f"[*] Custom 创建邮箱失败: {e}")
+        return "", ""
+
+
 def _try_duckmail(proxies: Any, duckmail_key: str) -> tuple:
     """尝试用 DuckMail 创建邮箱。有 key 用认证模式，无 key 用公共模式。"""
     try:
@@ -3220,13 +4685,15 @@ def _try_tempmail_lol(proxies: Any) -> tuple:
             primary_families = [managed_family]
             preferred_families = [managed_family]
         else:
-            primary_families = _fallback_login_families(limit=2)
-            preferred_families = _preferred_domain_families(limit=4, score_window=80)
+            primary_families = []
+            preferred_families = []
         for attempt in range(1, TEMPMAIL_LOL_MAX_CREATE_ATTEMPTS + 1):
             request_payload: Dict[str, Any] = {}
             domains = _managed_target_domains()
             if domains:
                 request_payload["domain"] = _pick_experiment2_domain(domains)
+            elif _TEMPMAIL_FORCE_DOMAINS:
+                request_payload["domain"] = random.choice(_TEMPMAIL_FORCE_DOMAINS)
             resp = requests.post(
                 f"{TEMPMAIL_LOL_BASE}/inbox/create",
                 headers={"Content-Type": "application/json"},
@@ -3395,8 +4862,8 @@ def _try_self_hosted_messages_api(proxies: Any = None) -> tuple:
             raise RuntimeError("SELF_HOSTED_MESSAGES_DOMAINS 为空")
         selected_domain = _pick_domain(domains) or random.choice(domains)
         local = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-        local_ = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
-        email = f"{local}@{local_}.{selected_domain}"
+        subdomain = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
+        email = f"{local}@{subdomain}.{selected_domain}"
         print(f"[*] messages-api 邮箱: {email}")
         return email, f"self_hosted_messages_api:{email}"
     except Exception as e:
@@ -3405,7 +4872,7 @@ def _try_self_hosted_messages_api(proxies: Any = None) -> tuple:
 
 
 def _get_email_and_token_impl(proxies: Any = None) -> tuple:
-    """从已启用的邮箱源中随机选一个，失败后依次尝试其余，最后兜底 mail.gw"""
+    """从已启用的邮箱源中选择邮箱；当前固定为 self_hosted_messages_api。"""
     if MAIL_PROVIDER_MODE == "self_hosted_messages_api":
         for round_idx in range(1, DEFAULT_EMAIL_SOURCE_ROUNDS + 1):
             print(
@@ -3416,9 +4883,14 @@ def _get_email_and_token_impl(proxies: Any = None) -> tuple:
             if email and token:
                 return email, token
         return "", ""
-
+    if _custom_enabled:
+        print("[*] mailbox mode override: force custom only")
+        return _try_custom_mailbox(proxies)
     if _alpha_enabled:
         return _try_alpha_infini(proxies)
+    if _skymail_preferred and MAIL_SOURCES.get("skymail") and not _legacy_mail_mode:
+        print("[*] mailbox mode override: force skymail only")
+        return _try_skymail_forced(proxies)
 
     enabled = []
     if MAIL_SOURCES.get("dropmail") and not _legacy_mail_mode:
@@ -3667,6 +5139,7 @@ def _extract_mail_verification_code(content: str) -> str:
 
 
 def _self_hosted_messages_fetch_messages(email: str, proxies: Any = None) -> List[Dict[str, Any]]:
+    del proxies
     if not email:
         return []
     try:
@@ -3695,7 +5168,7 @@ def _poll_hydra_otp(base_url: str, token: str, regex: str, proxies: Any = None, 
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
     for _ in range(40):
-        print(".", end="", flush=True)
+        _poll_progress_tick()
         try:
             resp = requests.get(
                 f"{base_url}/messages",
@@ -3799,17 +5272,20 @@ def _get_oai_code_impl(token: str, email: str, proxies: Any = None, seen_msg_ids
     if token.startswith("self_hosted_messages_api:"):
         mailbox_email = token[len("self_hosted_messages_api:"):].strip() or email
         for _ in range(40):
-            print(".", end="", flush=True)
+            _poll_progress_tick()
             try:
                 messages = _self_hosted_messages_fetch_messages(mailbox_email, proxies)
                 for msg in messages[:20]:
+                    if not isinstance(msg, dict):
+                        continue
                     msg_key = _mail_message_seen_key(msg)
                     if msg_key and msg_key in seen_msg_ids:
                         continue
                     if msg_key:
                         seen_msg_ids.add(msg_key)
                     content = _flatten_mail_content(msg)
-                    if "openai" not in content.lower() and "chatgpt" not in content.lower():
+                    lowered = content.lower()
+                    if "openai" not in lowered and "chatgpt" not in lowered:
                         continue
                     code = _extract_mail_verification_code(content)
                     if code:
@@ -3829,7 +5305,7 @@ def _get_oai_code_impl(token: str, email: str, proxies: Any = None, seen_msg_ids
         parts = token[len("onesecmail:"):].split(":", 1)
         login, domain = parts[0], parts[1]
         for _ in range(40):
-            print(".", end="", flush=True)
+            _poll_progress_tick()
             try:
                 resp = requests.get(
                     f"{ONESECMAIL_BASE}?action=getMessages&login={login}&domain={domain}",
@@ -3870,7 +5346,7 @@ def _get_oai_code_impl(token: str, email: str, proxies: Any = None, seen_msg_ids
     if token.startswith("dropmail:"):
         api_token, session_id = _dropmail_parse_token(token)
         for _ in range(40):
-            print(".", end="", flush=True)
+            _poll_progress_tick()
             try:
                 messages = _dropmail_list_messages(api_token, session_id, proxies)
                 for msg in messages:
@@ -3897,7 +5373,7 @@ def _get_oai_code_impl(token: str, email: str, proxies: Any = None, seen_msg_ids
     if token.startswith("skymail:"):
         mailbox_email = token[len("skymail:"):].strip()
         for _ in range(40):
-            print(".", end="", flush=True)
+            _poll_progress_tick()
             try:
                 messages = sorted(
                     _skymail_fetch_emails(mailbox_email, proxies),
@@ -3933,6 +5409,72 @@ def _get_oai_code_impl(token: str, email: str, proxies: Any = None, seen_msg_ids
         print(" alpha-infini 暂未实现验证码轮询")
         return ""
 
+    if token.startswith("custom:"):
+        mailbox_email, created_after_ts = _custom_parse_token_metadata(token, email)
+        poll_rounds = _custom_poll_rounds()
+        use_batch_cache = int(_worker_count_hint or 1) >= 256 and _custom_batch_async_enabled()
+        _custom_batch_register(mailbox_email, created_after_ts)
+        with _custom_otp_wait_slot() as wait_allowed:
+            if not wait_allowed:
+                _custom_batch_unregister(mailbox_email)
+                return ""
+            try:
+                for poll_idx in range(poll_rounds):
+                    _poll_progress_tick()
+                    messages = []
+                    try:
+                        if use_batch_cache:
+                            messages = _custom_batch_cached_messages(mailbox_email)
+                            if not messages:
+                                with _custom_batch_watch_cv:
+                                    _custom_batch_watch_cv.wait(timeout=0.75)
+                                messages = _custom_batch_cached_messages(mailbox_email)
+                        if not messages:
+                            should_direct_fetch = (
+                                not use_batch_cache
+                                or poll_idx == 0
+                                or poll_idx + 1 >= poll_rounds
+                                or ((poll_idx + 1) % 4 == 0)
+                            )
+                            if should_direct_fetch:
+                                messages = _custom_fetch_recent_messages(
+                                    mailbox_email=mailbox_email,
+                                    created_after_ts=created_after_ts,
+                                )
+                        for msg in messages:
+                            if not isinstance(msg, dict):
+                                continue
+                            msg_key = _mail_message_seen_key(msg)
+                            if msg_key and msg_key in seen_msg_ids:
+                                continue
+                            if msg_key:
+                                seen_msg_ids.add(msg_key)
+                            content = "\n".join([
+                                str(msg.get("subject") or ""),
+                                str(msg.get("text") or ""),
+                            ])
+                            otp_code = str(msg.get("otp_code") or "").strip()
+                            if otp_code and re.fullmatch(regex, otp_code):
+                                print(" found code", otp_code)
+                                return otp_code
+                            if "openai" not in content.lower():
+                                continue
+                            m = re.search(regex, content)
+                            if m:
+                                print(" found code", m.group(1))
+                                return m.group(1)
+                    except Exception:
+                        pass
+                    if use_batch_cache:
+                        with _custom_batch_watch_cv:
+                            _custom_batch_watch_cv.wait(timeout=0.7)
+                    else:
+                        _sleep_custom_poll_delay()
+                print(" timeout")
+                return ""
+            finally:
+                _custom_batch_unregister(mailbox_email)
+
     if token.startswith("duckmail:"):
         return _poll_hydra_otp(DUCKMAIL_BASE, token[len("duckmail:"):], regex, proxies, seen_msg_ids)
 
@@ -3940,7 +5482,7 @@ def _get_oai_code_impl(token: str, email: str, proxies: Any = None, seen_msg_ids
         # tempmail.lol 模式
         real_token = token[len("tempmail_lol:"):]
         for _ in range(40):
-            print(".", end="", flush=True)
+            _poll_progress_tick()
             try:
                 resp = requests.get(
                     f"{TEMPMAIL_LOL_BASE}/inbox?token={real_token}",
@@ -4047,17 +5589,20 @@ def _get_oai_verify_impl(token: str, email: str, proxies: Any = None) -> str:
     if token.startswith("self_hosted_messages_api:"):
         mailbox_email = token[len("self_hosted_messages_api:"):].strip() or email
         for _ in range(40):
-            print(".", end="", flush=True)
+            _poll_progress_tick()
             try:
                 messages = _self_hosted_messages_fetch_messages(mailbox_email, proxies)
                 for msg in messages[:20]:
+                    if not isinstance(msg, dict):
+                        continue
                     msg_key = _mail_message_seen_key(msg)
                     if msg_key and msg_key in seen_ids:
                         continue
                     if msg_key:
                         seen_ids.add(msg_key)
                     content = _flatten_mail_content(msg)
-                    if "openai" not in content.lower() and "chatgpt" not in content.lower():
+                    lowered = content.lower()
+                    if "openai" not in lowered and "chatgpt" not in lowered:
                         continue
                     result = _extract(content)
                     if result:
@@ -4073,7 +5618,7 @@ def _get_oai_verify_impl(token: str, email: str, proxies: Any = None) -> str:
         parts = token[len("onesecmail:"):].split(":", 1)
         login, domain = parts[0], parts[1]
         for _ in range(40):
-            print(".", end="", flush=True)
+            _poll_progress_tick()
             try:
                 resp = requests.get(
                     f"{ONESECMAIL_BASE}?action=getMessages&login={login}&domain={domain}",
@@ -4107,7 +5652,7 @@ def _get_oai_verify_impl(token: str, email: str, proxies: Any = None) -> str:
     if token.startswith("dropmail:"):
         api_token, session_id = _dropmail_parse_token(token)
         for _ in range(40):
-            print(".", end="", flush=True)
+            _poll_progress_tick()
             try:
                 messages = _dropmail_list_messages(api_token, session_id, proxies)
                 for msg in messages:
@@ -4137,7 +5682,7 @@ def _get_oai_verify_impl(token: str, email: str, proxies: Any = None) -> str:
         base_url = DUCKMAIL_BASE
         headers = {"Authorization": f"Bearer {real_token}", "Accept": "application/json"}
         for _ in range(40):
-            print(".", end="", flush=True)
+            _poll_progress_tick()
             try:
                 resp = requests.get(f"{base_url}/messages", headers=headers, proxies=proxies, impersonate="chrome", timeout=15)
                 if resp.status_code != 200:
@@ -4174,7 +5719,7 @@ def _get_oai_verify_impl(token: str, email: str, proxies: Any = None) -> str:
     if token.startswith("tempmail_lol:"):
         real_token = token[len("tempmail_lol:"):]
         for _ in range(40):
-            print(".", end="", flush=True)
+            _poll_progress_tick()
             try:
                 resp = requests.get(f"{TEMPMAIL_LOL_BASE}/inbox?token={real_token}", proxies=proxies, impersonate="chrome", timeout=15)
                 if resp.status_code != 200:
@@ -4198,7 +5743,7 @@ def _get_oai_verify_impl(token: str, email: str, proxies: Any = None) -> str:
 
     # mail.gw 模式
     for _ in range(40):
-        print(".", end="", flush=True)
+        _poll_progress_tick()
         try:
             resp = requests.get(f"{MAILTM_BASE}/messages", headers=_mailtm_headers(token=token), proxies=proxies, impersonate="chrome", timeout=15)
             if resp.status_code != 200:
@@ -4519,6 +6064,55 @@ def _follow_redirect_chain_for_callback(
         )
         location = resp.headers.get("Location") or ""
         if resp.status_code not in [301, 302, 303, 307, 308]:
+            try:
+                response_url = str(getattr(resp, "url", "") or current_url).strip() or current_url
+                if "code=" in response_url and "state=" in response_url:
+                    if "chatgpt.com/api/auth/callback/openai" in response_url:
+                        callback_json = _chatgpt_experiment_finish_session(
+                            session=session,
+                            callback_url=response_url,
+                            proxies=proxies,
+                            user_agent=user_agent,
+                            sec_ch_ua=sec_ch_ua,
+                            label=label,
+                        )
+                        if callback_json:
+                            return callback_json
+                    return submit_callback_url(
+                        callback_url=response_url,
+                        code_verifier=oauth.code_verifier,
+                        redirect_uri=oauth.redirect_uri,
+                        client_id=oauth.client_id,
+                        expected_state=oauth.state,
+                        proxies=proxies,
+                    )
+                response_text = str(getattr(resp, "text", "") or "")
+                callback_candidates = _extract_callback_candidates_from_text(
+                    response_text,
+                    base_url=response_url,
+                )
+                for candidate in callback_candidates:
+                    if "chatgpt.com/api/auth/callback/openai" in candidate:
+                        callback_json = _chatgpt_experiment_finish_session(
+                            session=session,
+                            callback_url=candidate,
+                            proxies=proxies,
+                            user_agent=user_agent,
+                            sec_ch_ua=sec_ch_ua,
+                            label=label,
+                        )
+                        if callback_json:
+                            return callback_json
+                    return submit_callback_url(
+                        callback_url=candidate,
+                        code_verifier=oauth.code_verifier,
+                        redirect_uri=oauth.redirect_uri,
+                        client_id=oauth.client_id,
+                        expected_state=oauth.state,
+                        proxies=proxies,
+                    )
+            except Exception:
+                pass
             return None
         if not location:
             return None
@@ -4528,6 +6122,31 @@ def _follow_redirect_chain_for_callback(
         current_url = next_url
 
     return None
+
+
+def _extract_callback_candidates_from_text(text: str, base_url: str = "") -> List[str]:
+    body = str(text or "")
+    if not body:
+        return []
+    candidates: List[str] = []
+    patterns = [
+        r'https?://[^\s"\'<>]+(?:code=[^"\'>\s]+&state=[^"\'>\s]+|state=[^"\'>\s]+&code=[^"\'>\s]+)',
+        r'/api/auth/callback/openai\?[^\s"\'<>]+',
+        r'https?://[^\s"\'<>]*?/api/auth/callback/openai\?[^\s"\'<>]+',
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, body, re.I):
+            candidate = str(match or "").strip()
+            if not candidate:
+                continue
+            if candidate.startswith("/"):
+                if not base_url:
+                    continue
+                candidate = urllib.parse.urljoin(base_url, candidate)
+            if "code=" not in candidate or "state=" not in candidate:
+                continue
+            candidates.append(candidate)
+    return _dedupe_keep_order(candidates)
 
 
 def _page_type_to_path(page_type: str) -> str:
@@ -5030,6 +6649,7 @@ def _chatgpt_experiment_try_passwordless_formal_token(
             flow=flow,
             user_agent=user_agent,
             proxy_url=_extract_proxy_url_from_proxies(proxies),
+            did=did,
         )
         if sdk_token:
             return sdk_token
@@ -5051,6 +6671,7 @@ def _chatgpt_experiment_try_passwordless_formal_token(
     def _headers(referer: str, sentinel: str) -> Dict[str, str]:
         return {
             "referer": referer,
+            "origin": "https://auth.openai.com",
             "accept": "application/json",
             "content-type": "application/json",
             "openai-sentinel-token": sentinel,
@@ -5312,6 +6933,7 @@ def _chatgpt_experiment_passwordless_login_to_formal(
             flow=flow,
             user_agent=user_agent,
             proxy_url=_extract_proxy_url_from_proxies(proxies),
+            did=did,
         )
         if sdk_token:
             return sdk_token
@@ -5333,6 +6955,7 @@ def _chatgpt_experiment_passwordless_login_to_formal(
     def _headers(referer: str, sentinel: str) -> dict:
         return {
             "referer": referer,
+            "origin": "https://auth.openai.com",
             "accept": "application/json",
             "content-type": "application/json",
             "openai-sentinel-token": sentinel,
@@ -5517,6 +7140,7 @@ def _chatgpt_experiment_same_session_login_to_formal(
             flow=flow,
             user_agent=user_agent,
             proxy_url=_extract_proxy_url_from_proxies(proxies),
+            did=raw_did,
         )
         if sdk_token:
             return sdk_token
@@ -5538,6 +7162,7 @@ def _chatgpt_experiment_same_session_login_to_formal(
     def _headers(referer: str, sentinel: str) -> dict:
         return {
             "referer": referer,
+            "origin": "https://auth.openai.com",
             "accept": "application/json",
             "content-type": "application/json",
             "openai-sentinel-token": sentinel,
@@ -5594,6 +7219,20 @@ def _chatgpt_experiment_same_session_login_to_formal(
         )
         print(f"[*] experiment same-session password verify: {pwd_resp.status_code}")
         if pwd_resp.status_code != 200:
+            _update_run_context(
+                last_branch_result=_response_error_reason(
+                    pwd_resp,
+                    fallback=f"signup_password_http_{pwd_resp.status_code}",
+                ),
+            )
+            _update_run_context(
+                last_branch_result=_response_error_reason(
+                    pwd_resp,
+                    fallback=f"signup_password_http_{pwd_resp.status_code}",
+                ),
+                last_branch_page="create_account_password",
+                last_branch_continue_url="https://auth.openai.com/api/accounts/user/register",
+            )
             print(f"[Warn] experiment same-session password body: {pwd_resp.text[:400]}")
             return None
         pwd_data = pwd_resp.json() if pwd_resp.text.strip() else {}
@@ -6339,6 +7978,8 @@ def _record_experiment2_branch(
         run_ctx["last_branch_result"] = result
         _append_run_context_value("branch_results", result)
         _append_run_context_value("branch_domains", domain)
+    if not _experiment2_io_enabled():
+        return
     payload = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "run_id": run_ctx.get("run_id") if run_ctx else None,
@@ -6370,6 +8011,8 @@ def _record_experiment2_run_result(
     error: str = "",
 ) -> None:
     if not (_experiment2_enabled or _beta_enabled or _beta2_enabled):
+        return
+    if not _experiment2_io_enabled():
         return
     run_ctx = _current_run_context() or {}
     payload = {
@@ -6519,8 +8162,6 @@ def _pick_experiment2_domain(domains: List[str]) -> str:
 
 
 def _prepare_v2rayn_proxy(proxy: Optional[str]) -> Optional[str]:
-    raw_proxy = "" if proxy is None else str(proxy).strip()
-    auto_mode = not raw_proxy or raw_proxy.lower() == "auto"
     candidates = _candidate_proxy_urls(proxy)
     if not candidates:
         print("[V2RayN] proxy disabled; using direct connection")
@@ -6542,12 +8183,8 @@ def _prepare_v2rayn_proxy(proxy: Optional[str]) -> Optional[str]:
             print(f"[V2RayN] probe failed {candidate}: {e}")
 
     if first_success:
-        print("[V2RayN] 10808 is reachable but exit loc is still CN/HK; switch node in v2rayN")
+        print("[V2RayN] local proxy is reachable but exit loc is still CN/HK; switch node in v2rayN")
         return first_success
-
-    if auto_mode:
-        print("[V2RayN] auto scan found no reachable local proxy; using direct connection")
-        return None
 
     fallback = _normalize_proxy_url(proxy)
     if fallback:
@@ -6625,6 +8262,7 @@ def _login_for_token(
                 flow=flow,
                 user_agent=user_agent,
                 proxy_url=_extract_proxy_url_from_proxies(proxies),
+                did=did,
             )
             if sdk_token:
                 return sdk_token
@@ -6647,6 +8285,7 @@ def _login_for_token(
         def _headers(referer: str, sentinel: str) -> dict:
             return {
                 "referer": referer,
+                "origin": "https://auth.openai.com",
                 "accept": "application/json",
                 "content-type": "application/json",
                 "openai-sentinel-token": sentinel,
@@ -6978,7 +8617,8 @@ def run(
 
     proxy = None if proxy is None else _normalize_proxy_url(proxy)
     proxies = _build_proxies(proxy)
-    print(f"[Run] build={SCRIPT_BUILD} proxy={proxy or 'direct'}")
+    if _hot_log_enabled():
+        print(f"[Run] build={SCRIPT_BUILD} proxy={proxy or 'direct'}")
 
     _impersonate, _user_agent, _sec_ch_ua = _random_chrome_profile()
     _accept_language = _runtime_accept_language(_impersonate, _user_agent)
@@ -6987,7 +8627,7 @@ def run(
         s.headers.update({"Accept-Language": _accept_language})
     except Exception:
         pass
-    if _experiment2_enabled:
+    if _experiment2_enabled and _hot_log_enabled():
         print(
             "[*] experiment2 runtime: "
             f"profile={_experiment2_profile_name} family={_experiment2_force_family} "
@@ -6995,14 +8635,28 @@ def run(
         )
 
     try:
-        trace = _request_with_retries(
-            lambda: s.get(_PROXY_TRACE_URL, timeout=10),
-            label="proxy-trace",
-        )
-        trace = trace.text
-        loc_re = re.search(r"^loc=(.+)$", trace, re.MULTILINE)
-        loc = loc_re.group(1) if loc_re else None
-        print(f"[Net] trace loc={loc}")
+        cache_key = str(proxy or "direct")
+        loc = ""
+        now = time.time()
+        with _proxy_trace_cache_lock:
+            cached = _proxy_trace_cache.get(cache_key) or {}
+            if float(cached.get("expires_at_ts") or 0.0) > now:
+                loc = str(cached.get("loc") or "")
+        if not loc:
+            trace = _request_with_retries(
+                lambda: s.get(_PROXY_TRACE_URL, timeout=10),
+                label="proxy-trace",
+            )
+            trace = trace.text
+            loc_re = re.search(r"^loc=(.+)$", trace, re.MULTILINE)
+            loc = loc_re.group(1) if loc_re else ""
+            with _proxy_trace_cache_lock:
+                _proxy_trace_cache[cache_key] = {
+                    "loc": loc,
+                    "expires_at_ts": now + PROXY_TRACE_CACHE_TTL_SECONDS,
+                }
+        if _hot_log_enabled():
+            print(f"[Net] trace loc={loc}")
         if loc == "CN" or loc == "HK":
             raise RuntimeError("proxy exit location is not supported")
     except Exception as e:
@@ -7016,12 +8670,8 @@ def run(
         email=email,
         domain=_extract_email_domain(email),
     )
-    print(f"[*] 成功获取临时邮箱: {email}")
-
-    if _worker_count_hint > 1:
-        auth_jitter = random.uniform(0.6, min(6.0, 1.3 * _worker_count_hint))
-        print(f"[*] auth start jitter {auth_jitter:.1f}s")
-        time.sleep(auth_jitter)
+    if _hot_log_enabled():
+        print(f"[*] 成功获取临时邮箱: {email}")
 
     try:
         if _experiment_enabled:
@@ -7042,12 +8692,17 @@ def run(
             lambda: s.get(url, timeout=15),
             label="oauth-entry",
         )
+        _update_run_context(
+            last_branch_page="oauth_entry",
+            last_branch_continue_url=str(url or ""),
+        )
         did = _read_cookie_value(
             s,
             "oai-did",
             preferred_domains=["auth.openai.com", "openai.com", "chatgpt.com"],
         )
-        print(f"[*] Device ID: {did}")
+        if _hot_log_enabled():
+            print(f"[*] Device ID: {did}")
         _update_run_context(did=did)
 
         def _get_sentinel(flow: str = SENTINEL_FLOW_SIGNUP_EMAIL) -> str:
@@ -7056,6 +8711,7 @@ def run(
                 flow=flow,
                 user_agent=_user_agent,
                 proxy_url=_extract_proxy_url_from_proxies(proxies),
+                did=did,
             )
             if sdk_token:
                 return sdk_token
@@ -7078,6 +8734,7 @@ def run(
         def _auth_headers(referer: str, sentinel: str) -> dict:
             return {
                 "referer": referer,
+                "origin": "https://auth.openai.com",
                 "accept": "application/json",
                 "content-type": "application/json",
                 "openai-sentinel-token": sentinel,
@@ -7100,6 +8757,10 @@ def run(
                 data=signup_body,
             ),
             label="signup-email",
+        )
+        _update_run_context(
+            last_branch_page="authorize_continue",
+            last_branch_continue_url="https://auth.openai.com/api/accounts/authorize/continue",
         )
         _raise_if_blacklistable_email_error(signup_resp, email, stage="signup_email")
         print(f"[*] 提交注册邮箱状态: {signup_resp.status_code}")
@@ -7134,27 +8795,89 @@ def run(
         # Sentinel flow: create_account_password
         time.sleep(random.uniform(0.5, 1.5))
         password = secrets.token_urlsafe(18)
-        sentinel = _get_sentinel(flow=SENTINEL_FLOW_CREATE_PASSWORD)
         pwd_body = json.dumps({"password": password, "username": email})
-        pwd_resp = _request_with_retries(
-            lambda: s.post(
-                "https://auth.openai.com/api/accounts/user/register",
-                headers=_auth_headers(
-                    "https://auth.openai.com/create-account/password", sentinel
+        pwd_resp = None
+        pwd_variants = [
+            (SENTINEL_FLOW_CREATE_PASSWORD, "https://auth.openai.com/create-account/password"),
+            (SENTINEL_FLOW_PASSWORD_VERIFY, "https://auth.openai.com/log-in/password"),
+            (SENTINEL_FLOW_SIGNUP_EMAIL, "https://auth.openai.com/create-account"),
+        ]
+        for pwd_try, (pwd_flow, pwd_referer) in enumerate(pwd_variants, start=1):
+            try:
+                if continue_url and pwd_try > 1:
+                    s.get(
+                        continue_url,
+                        headers={
+                            "referer": "https://auth.openai.com/create-account",
+                            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        },
+                        allow_redirects=True,
+                        timeout=20,
+                    )
+            except Exception:
+                pass
+            try:
+                if pwd_try > 1:
+                    s.get(
+                        pwd_referer,
+                        headers={"referer": "https://auth.openai.com/create-account"},
+                        allow_redirects=True,
+                        timeout=20,
+                    )
+            except Exception:
+                pass
+            sentinel = _get_sentinel(flow=pwd_flow)
+            pwd_resp = _request_with_retries(
+                lambda: s.post(
+                    "https://auth.openai.com/api/accounts/user/register",
+                    headers=_auth_headers(pwd_referer, sentinel),
+                    data=pwd_body,
                 ),
-                data=pwd_body,
-            ),
-            label="signup-password",
+                label="signup-password",
+            )
+            if pwd_resp.status_code == 200:
+                break
+            _update_run_context(
+                last_branch_result=_response_error_reason(
+                    pwd_resp,
+                    fallback=f"signup_password_http_{pwd_resp.status_code}",
+                ),
+                last_branch_page="create_account_password",
+                last_branch_continue_url="https://auth.openai.com/api/accounts/user/register",
+            )
+            blacklist_reason = _blacklist_reason_from_response(pwd_resp)
+            retryable_pwd = (
+                blacklist_reason == "failed_to_create_account"
+                or pwd_resp.status_code in {400, 403, 429}
+            )
+            if blacklist_reason == "unsupported_email" or not retryable_pwd or pwd_try >= len(pwd_variants):
+                break
+            time.sleep(random.uniform(0.6, 1.4))
+        _update_run_context(
+            last_branch_page="create_account_password",
+            last_branch_continue_url="https://auth.openai.com/api/accounts/user/register",
         )
         _raise_if_blacklistable_email_error(pwd_resp, email, stage="create_password")
         print(f"[*] 设置密码状态: {pwd_resp.status_code}")
         if pwd_resp.status_code != 200:
+            _update_run_context(
+                last_branch_result=_response_error_reason(
+                    pwd_resp,
+                    fallback=f"signup_password_http_{pwd_resp.status_code}",
+                ),
+                last_branch_page="create_account_password",
+                last_branch_continue_url="https://auth.openai.com/api/accounts/user/register",
+            )
             print(f"[Error] 设置密码失败: {pwd_resp.text}")
             return None
 
         pwd_data = pwd_resp.json() if pwd_resp.text.strip() else {}
         pwd_page_type = (pwd_data.get("page") or {}).get("type", "")
         pwd_continue = pwd_data.get("continue_url", "")
+        _update_run_context(
+            last_branch_result=f"pwd_page:{pwd_page_type or '<none>'}",
+            pwd_page_type=str(pwd_page_type or ""),
+        )
 
         # --- 3. 邮箱验证（如需要）---
         if "email" in pwd_page_type.lower() or "verify" in pwd_page_type.lower() or "otp" in pwd_page_type.lower():
@@ -7230,6 +8953,10 @@ def run(
                 # 跟踪 OTP 验证后的 continue_url
                 otp_data = otp_resp.json() if otp_resp.text.strip() else {}
                 otp_continue = otp_data.get("continue_url", "")
+                _update_run_context(
+                    last_branch_page="email_otp_verification",
+                    last_branch_continue_url="https://auth.openai.com/api/accounts/email-otp/validate",
+                )
                 if otp_continue:
                     s.get(otp_continue, headers={"referer": "https://auth.openai.com/email-verification"}, allow_redirects=True)
             else:
@@ -7266,10 +8993,28 @@ def run(
             ),
             label="create-account",
         )
+        _update_run_context(
+            last_branch_page="about_you",
+            last_branch_continue_url="https://auth.openai.com/api/accounts/create_account",
+        )
         _raise_if_blacklistable_email_error(create_account_resp, email, stage="create_account")
         create_account_status = create_account_resp.status_code
 
         if create_account_status != 200:
+            _update_run_context(
+                last_branch_result=_response_error_reason(
+                    create_account_resp,
+                    fallback=f"create_account_http_{create_account_status}",
+                ),
+            )
+            _update_run_context(
+                last_branch_result=_response_error_reason(
+                    create_account_resp,
+                    fallback=f"create_account_http_{create_account_status}",
+                ),
+                last_branch_page="about_you",
+                last_branch_continue_url="https://auth.openai.com/api/accounts/create_account",
+            )
             print(f"[Error] 账户创建失败: {create_account_resp.text[:200]}")
             return None
 
@@ -7534,7 +9279,15 @@ def run(
 
         if not workspaces and not phone_required:
             print("[*] 探测 codex consent/workspace 页面...")
-            candidate_pages = []
+            candidate_pages = _dedupe_keep_order(
+                [
+                    str(ca_continue or "").strip(),
+                    _page_type_to_url(ca_page_type),
+                    "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                    "https://auth.openai.com/sign-in-with-chatgpt/codex/organization",
+                    "https://auth.openai.com/workspace",
+                ]
+            )
             for candidate in candidate_pages:
                 callback_json = _follow_redirect_chain_for_callback(
                     session=s,
@@ -7548,6 +9301,15 @@ def run(
                 if callback_json:
                     print(f"[*] 注册流程通过页面探测拿到 OAuth callback: {candidate}")
                     return callback_json
+                try:
+                    s.get(
+                        candidate,
+                        headers={"referer": "https://auth.openai.com/about-you"},
+                        allow_redirects=True,
+                        timeout=15,
+                    )
+                except Exception:
+                    pass
 
             dump_state = _fetch_client_auth_session_dump(s)
             if dump_state.get("workspaces"):
@@ -7798,24 +9560,13 @@ def push_to_sub2api(token_json_str: str) -> bool:
 
 
 def main() -> None:
-    global _worker_count_hint, _experiment_enabled, _experiment2_enabled, _beta_enabled, _beta2_enabled, _alpha_enabled, _skymail_preferred, _legacy_mail_mode, _dropmail_pool_mode, _no_blacklist_mode, _browser_mode, _low_mode
+    global _worker_count_hint, _experiment_enabled, _experiment2_enabled, _beta_enabled, _beta2_enabled, _alpha_enabled, _custom_enabled, _skymail_preferred, _legacy_mail_mode, _dropmail_pool_mode, _no_blacklist_mode, _browser_mode, _low_mode
     global _experiment2_fresh_cloudvxz, _experiment2_fresh_count, _experiment2_fresh_lengths, _experiment2_fresh_pool
-    global manage
     parser = argparse.ArgumentParser(description="OpenAI 自动注册脚本")
-    parser.add_argument(
-        "--cpa-base-url",
-        default="",
-        help=f"CPA 上传服务地址，默认 {DEFAULT_CPA_BASE_URL}",
-    )
-    parser.add_argument(
-        "--cpa-token",
-        default="",
-        help="CPA 上传服务 Bearer Token；不传则使用环境变量或当前默认值",
-    )
     parser.add_argument(
         "--proxy",
         default="",
-        help="代理地址；未传时自动探测本地 127.0.0.1 候选端口，传 direct/off 可关闭",
+        help="代理地址；默认自动探测本机 127.0.0.1 的候选端口，传 direct/off 可关闭",
     )
     parser.add_argument("--once", action="store_true", help="只运行一次")
     parser.add_argument("--sleep-min", type=int, default=5, help="循环模式最短等待秒数")
@@ -7823,18 +9574,8 @@ def main() -> None:
         "--sleep-max", type=int, default=30, help="循环模式最长等待秒数"
     )
     parser.add_argument(
-        "--workers", type=int, default=50,
-        help="并发线程数；默认 50，传 1 为串行",
-    )
-    parser.add_argument(
-        "--auto-workers",
-        action="store_true",
-        help=f"按可用 CPU 自动计算线程数（{AUTO_WORKERS_PER_HCPU} threads / hcpu）",
-    )
-    parser.add_argument(
-        "--verbose-logs",
-        action="store_true",
-        help="打印完整详细日志；默认使用精简日志模式",
+        "--workers", type=int, default=1,
+        help="并发线程数（默认 1，串行；>1 时并发注册）"
     )
     parser.add_argument(
         "--mailbox-limit", type=int, default=0,
@@ -7855,6 +9596,20 @@ def main() -> None:
     parser.add_argument(
         "--target-tokens", type=int, default=0,
         help="0 means unlimited; stop after minting this many new tokens in current run",
+    )
+    parser.add_argument(
+        "--max-remote-files", type=int, default=0,
+        help="remote auth-files upper bound; when reached, pause new runs and recheck every 5 minutes",
+    )
+    parser.add_argument(
+        "--cpa-base-url",
+        default="",
+        help="auth-files management base url; overrides CPA_BASE_URL/CPA_URL/ZEABUR_AUTH_BASE_URL",
+    )
+    parser.add_argument(
+        "--cpa-token",
+        default="",
+        help="auth-files management bearer token; overrides CPA_TOKEN/ZEABUR_AUTH_TOKEN",
     )
     parser.add_argument(
         "--experiment",
@@ -7918,9 +9673,14 @@ def main() -> None:
         help="force infini-ai.eu.cc subdomain mailbox source",
     )
     parser.add_argument(
+        "--custom",
+        action="store_true",
+        help="force custom catch-all IMAP mailbox only (no fallback)",
+    )
+    parser.add_argument(
         "--skymail",
         action="store_true",
-        help="prefer skymail/cloudmail mailbox source if skymail_config.json or config.json is configured",
+        help="force skymail/cloudmail mailbox source only; on failure wait and retry skymail",
     )
     parser.add_argument(
         "--dropmail-pool",
@@ -7949,37 +9709,32 @@ def main() -> None:
         help="compatibility alias for the default low/original mode",
     )
     args = parser.parse_args()
-    _set_verbose_logs(args.verbose_logs)
+    args.proxy = _prepare_v2rayn_proxy(args.proxy)
+    if MAIL_PROVIDER_MODE == "self_hosted_messages_api":
+        fetch_email_domains(args.proxy)
     cpa_base_url, cpa_token = _resolve_cpa_settings(args.cpa_base_url, args.cpa_token)
     manage = ZeaburAuthFileManager(cpa_base_url, cpa_token)
-    proxy_arg_supplied = any(
-        arg == "--proxy" or arg.startswith("--proxy=")
-        for arg in sys.argv[1:]
-    )
-    if not proxy_arg_supplied:
-        args.proxy = "auto"
-    args.proxy = _prepare_v2rayn_proxy(args.proxy)
 
     sleep_min = max(1, args.sleep_min)
     sleep_max = max(sleep_min, args.sleep_max)
-    auto_worker_cpu = None
-    if args.auto_workers:
-        workers, auto_worker_cpu = _compute_auto_workers()
-        if args.workers != 50:
-            print(
-                f"[Warn] --auto-workers overrides --workers={args.workers}; "
-                f"using workers={workers}"
-            )
-    else:
-        workers = max(1, args.workers)
+    workers = max(1, args.workers)
+    if args.sleep_min == 5 and args.sleep_max == 30:
+        if workers >= 1024:
+            sleep_min, sleep_max = 1, 3
+        elif workers >= 512:
+            sleep_min, sleep_max = 1, 4
+        elif workers >= 256:
+            sleep_min, sleep_max = 1, 4
     _worker_count_hint = workers
     run_retries = max(0, args.run_retries)
     target_tokens = max(0, args.target_tokens)
+    max_remote_files = max(0, int(args.max_remote_files or 0))
     _experiment_enabled = bool(args.experiment)
     _experiment2_enabled = bool(args.experiment2)
     _beta_enabled = bool(args.beta)
     _beta2_enabled = bool(args.beta2)
     _alpha_enabled = bool(args.alpha)
+    _custom_enabled = bool(args.custom)
     _skymail_preferred = bool(args.skymail)
     _legacy_mail_mode = bool(args.legacy)
     _dropmail_pool_mode = str(args.dropmail_pool or "primary").strip().lower()
@@ -7988,6 +9743,7 @@ def main() -> None:
     _low_mode = not _browser_mode
     if MAIL_PROVIDER_MODE == "self_hosted_messages_api":
         _alpha_enabled = False
+        _custom_enabled = False
         _skymail_preferred = False
         _legacy_mail_mode = False
     if args.browser and args.low:
@@ -8000,6 +9756,7 @@ def main() -> None:
         for source_name in list(MAIL_SOURCES.keys()):
             MAIL_SOURCES[source_name] = (source_name == "self_hosted_messages_api")
     else:
+        MAIL_SOURCES["custom"] = True
         MAIL_SOURCES["skymail"] = _skymail_is_configured()
     if _experiment2_enabled:
         globals()["_experiment2_profile_name"] = str(args.experiment2_profile or "chrome146_current").strip()
@@ -8016,13 +9773,17 @@ def main() -> None:
                 _experiment2_fresh_count,
                 _experiment2_fresh_lengths,
             )
-    mailbox_limit = _resolve_stage_limit(args.mailbox_limit)
-    otp_limit = _resolve_stage_limit(args.otp_limit)
-    register_limit = _resolve_stage_limit(args.register_limit)
+    mailbox_limit = _resolve_stage_limit(args.mailbox_limit, stage_name="mailbox")
+    otp_limit = _resolve_stage_limit(args.otp_limit, stage_name="otp")
+    register_limit = _resolve_stage_limit(args.register_limit, stage_name="register")
 
     _set_stage_limit("mailbox", mailbox_limit)
     _set_stage_limit("otp", otp_limit)
     _set_stage_limit("register", register_limit)
+    globals()["_custom_http_slots"] = None if _resolve_custom_http_limit() is None else threading.BoundedSemaphore(max(1, int(_resolve_custom_http_limit() or 1)))
+    globals()["_custom_otp_wait_slots"] = None if _resolve_custom_otp_wait_limit() is None else threading.BoundedSemaphore(max(1, int(_resolve_custom_otp_wait_limit() or 1)))
+    globals()["_active_run_slots"] = None if _resolve_active_run_limit() is None else threading.BoundedSemaphore(max(1, int(_resolve_active_run_limit() or 1)))
+    globals()["_signup_http_slots"] = None if _resolve_signup_http_limit() is None else threading.BoundedSemaphore(max(1, int(_resolve_signup_http_limit() or 1)))
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     repair_result = _repair_token_exports(base_dir)
@@ -8030,70 +9791,140 @@ def main() -> None:
     _print_lock = threading.Lock()
     _file_lock = threading.Lock()
     _stop_event = threading.Event()
+    globals()["_stop_event"] = _stop_event
+    remote_file_limit_stop_event = threading.Event()
+    remote_file_limit_thread = None
+    with _remote_file_limit_lock:
+        global _remote_file_limit_pause_new_runs, _remote_file_limit_current_count, _remote_file_limit_max_count
+        _remote_file_limit_max_count = max_remote_files
+        _remote_file_limit_current_count = -1
+        _remote_file_limit_pause_new_runs = False
+    _memory_manager_stop_event.clear()
+    _custom_batch_dispatch_stop_event.clear()
+
+    def _apply_remote_file_limit_count(current_count: int, *, label: str) -> None:
+        global _remote_file_limit_pause_new_runs, _remote_file_limit_current_count, _remote_file_limit_max_count
+        if max_remote_files <= 0:
+            return
+        with _remote_file_limit_lock:
+            previous_pause = bool(_remote_file_limit_pause_new_runs)
+            current_snapshot = max(0, int(current_count or 0))
+            _remote_file_limit_max_count = max_remote_files
+            _remote_file_limit_current_count = current_snapshot
+            _remote_file_limit_pause_new_runs = current_snapshot >= max_remote_files
+            paused = bool(_remote_file_limit_pause_new_runs)
+        with _print_lock:
+            print(
+                f"[Info] remote auth-files count ({label}): "
+                f"{current_snapshot}/{max_remote_files} paused={'yes' if paused else 'no'}"
+            )
+            if paused and not previous_pause:
+                print("[Info] remote auth-files limit reached; pausing new runs")
+            elif not paused and previous_pause:
+                print("[Info] remote auth-files below limit; resuming new runs")
+
+    def _mark_remote_file_limit_check_failed(label: str, exc: Exception) -> None:
+        global _remote_file_limit_pause_new_runs, _remote_file_limit_current_count, _remote_file_limit_max_count
+        if max_remote_files <= 0:
+            return
+        with _remote_file_limit_lock:
+            previous_pause = bool(_remote_file_limit_pause_new_runs)
+            _remote_file_limit_max_count = max_remote_files
+            _remote_file_limit_current_count = -1
+            _remote_file_limit_pause_new_runs = True
+        with _print_lock:
+            if label == "startup" or not previous_pause:
+                print(f"[Warn] remote auth-files count check failed ({label}): {exc}; pausing new runs")
+            else:
+                print(f"[Warn] remote auth-files count recheck failed ({label}): {exc}")
+
+    def _refresh_remote_file_limit_state(label: str) -> None:
+        if max_remote_files <= 0:
+            return
+        try:
+            current_count = max(0, int(manage.count_files(strict=True)))
+        except Exception as exc:
+            _mark_remote_file_limit_check_failed(label, exc)
+            return
+        _apply_remote_file_limit_count(current_count, label=label)
+
+    def _record_remote_file_upload_success() -> None:
+        global _remote_file_limit_pause_new_runs, _remote_file_limit_current_count
+        if max_remote_files <= 0:
+            return
+        with _remote_file_limit_lock:
+            if int(_remote_file_limit_current_count or -1) < 0:
+                return
+            previous_pause = bool(_remote_file_limit_pause_new_runs)
+            _remote_file_limit_current_count = int(_remote_file_limit_current_count) + 1
+            current_snapshot = int(_remote_file_limit_current_count)
+            _remote_file_limit_pause_new_runs = current_snapshot >= max_remote_files
+            paused = bool(_remote_file_limit_pause_new_runs)
+        if paused and not previous_pause:
+            with _print_lock:
+                print(
+                    f"[Info] remote auth-files limit reached after upload: "
+                    f"{current_snapshot}/{max_remote_files}; pausing new runs"
+                )
+
+    def _remote_file_limit_loop() -> None:
+        while not remote_file_limit_stop_event.wait(REMOTE_FILE_LIMIT_CHECK_INTERVAL_SECONDS):
+            _refresh_remote_file_limit_state("periodic")
+
+    if max_remote_files > 0:
+        _refresh_remote_file_limit_state("startup")
+        remote_file_limit_thread = threading.Thread(
+            target=_remote_file_limit_loop,
+            name="remote-file-limit-checker",
+            daemon=True,
+        )
+        remote_file_limit_thread.start()
+
+    memory_manager = threading.Thread(target=_memory_manager_loop, name="memory-manager", daemon=True)
+    memory_manager.start()
+    batch_dispatcher = None
+    batch_dispatch_mode = _custom_batch_dispatch_mode()
+    globals()["_custom_batch_async_enabled_flag"] = bool(
+        _custom_enabled and workers >= 256 and batch_dispatch_mode == "async"
+    )
+    if _custom_batch_async_enabled():
+        batch_dispatcher = threading.Thread(target=_custom_batch_dispatch_loop, name="custom-batch-dispatch", daemon=True)
+        batch_dispatcher.start()
     _success_count = 0
     _success_count_lock = threading.Lock()
-    _flow_total_count = 0
-    _flow_success_count = 0
-    _flow_failed_count = 0
-    _flow_stats_lock = threading.Lock()
-
-    def _update_flow_stats(status: str) -> Tuple[int, int, int]:
-        nonlocal _flow_total_count, _flow_success_count, _flow_failed_count
-        with _flow_stats_lock:
-            if status == "success":
-                _flow_total_count += 1
-                _flow_success_count += 1
-            elif status != "stopped":
-                _flow_total_count += 1
-                _flow_failed_count += 1
-            return _flow_total_count, _flow_success_count, _flow_failed_count
-
-    def _emit_flow_summary(
-        worker_slot: int,
-        run_id: str,
-        status: str,
-        reason: str,
-        elapsed_seconds: float,
-        error: str = "",
-    ) -> None:
-        total_runs, success_runs, failed_runs = _update_flow_stats(status)
-        status_label = "SUCCESS" if status == "success" else ("STOPPED" if status == "stopped" else "FAILED")
-        with _print_lock:
-            _RAW_PRINT("")
-            _RAW_PRINT("=" * 78)
-            _RAW_PRINT(
-                f"[FLOW {status_label}] worker={worker_slot} run={run_id} elapsed={elapsed_seconds:.1f}s"
-            )
-            _RAW_PRINT(f"[FLOW REASON] {reason or 'n/a'}")
-            if error and status != "success":
-                _RAW_PRINT(f"[FLOW ERROR] {error}")
-            _RAW_PRINT(
-                f"[FLOW STATS] success={success_runs} failed={failed_runs} total={total_runs}"
-            )
-            if total_runs % 200 == 0:
-                fetch_email_domains()
-            if target_tokens > 0:
-                _RAW_PRINT(f"[FLOW TARGET] {success_runs}/{target_tokens}")
-            _RAW_PRINT("=" * 78)
 
     def _save_and_push(token_json: str) -> bool:
         nonlocal _success_count
         saved = _persist_token_artifacts(base_dir, token_json, _file_lock)
+        token_path = str(saved.get("token_path") or "").strip()
         with _print_lock:
-            if saved["token_path"]:
+            if token_path:
                 if saved.get("is_experiment"):
-                    print(f"[*] saved experiment session json: {saved['token_path']}")
+                    print(f"[*] saved experiment session json: {token_path}")
                 elif saved.get("was_local_promotion"):
-                    print(f"[*] saved promoted experiment token json: {saved['token_path']}")
+                    print(f"[*] saved promoted experiment token json: {token_path}")
                 else:
-                    print(f"[*] saved token json「˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚˚」: {saved['token_path']}")
-                    upload_status = manage.upload("",saved['token_path'])
-                    if bool(upload_status):
-                        print(f"上传成功✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅")
+                    print(f"[*] saved token json: {token_path}")
             if saved["access_token"] and not saved.get("is_experiment"):
                 print(f"[*] appended access token to: {saved['ak_path']}")
             if saved["refresh_token"] and not saved.get("is_experiment"):
                 print(f"[*] appended refresh token to: {saved['rk_path']}")
+        if token_path and not saved.get("is_experiment"):
+            try:
+                upload_ok, upload_resp = manage.upload(
+                    os.path.dirname(token_path),
+                    os.path.basename(token_path),
+                )
+                with _print_lock:
+                    if upload_ok:
+                        print(f"[*] uploaded token json: {os.path.basename(token_path)}")
+                    else:
+                        print(f"[Warn] upload token json failed: {upload_resp}")
+                if upload_ok:
+                    _record_remote_file_upload_success()
+            except Exception as e:
+                with _print_lock:
+                    print(f"[Warn] upload token json exception: {e}")
         if saved.get("is_experiment"):
             return False
         current_success = 0
@@ -8113,25 +9944,26 @@ def main() -> None:
                 print(f"[*] target progress: {current_success}/{target_tokens}")
                 if current_success >= target_tokens:
                     print(f"[*] target tokens reached ({target_tokens}), stopping workers...")
-        if SUB2API_ENABLED and not saved.get("was_local_promotion"):
+        if SUB2API_ENABLED and not TEST_DISABLE_SUB2API and not saved.get("was_local_promotion"):
             push_to_sub2api(saved.get("stored_token_json") or token_json)
         return True
 
     def _one_run(worker_slot: int, run_id: str) -> None:
         if _stop_event.is_set():
             return
+        _active_run_enter()
         _begin_run_context(run_id=run_id, worker_slot=worker_slot)
         final_status = "failed"
         final_reason = "no_token"
         final_error = ""
         token_saved = False
-        run_started_at = time.monotonic()
         try:
-            with _print_lock:
-                print(
-                    f"\n[{datetime.now().strftime('%H:%M:%S')}] "
-                    f">>> worker {worker_slot} run {run_id} start <<<"
-                )
+            if _hot_log_enabled():
+                with _print_lock:
+                    print(
+                        f"\n[{datetime.now().strftime('%H:%M:%S')}] "
+                        f">>> worker {worker_slot} run {run_id} start <<<"
+                    )
             effective_run_retries = 0 if (_low_mode or _experiment2_enabled) else run_retries
             for attempt in range(1, effective_run_retries + 2):
                 _update_run_context(attempts=attempt)
@@ -8140,8 +9972,7 @@ def main() -> None:
                     final_reason = "stop_event_before_attempt"
                     return
                 try:
-                    with _stage_slot("register"):
-                        token_json = run(args.proxy)
+                    token_json = run(args.proxy)
                     if token_json:
                         if _save_and_push(token_json):
                             final_status = "success"
@@ -8168,40 +9999,47 @@ def main() -> None:
                         branch_reason = str((_current_run_context() or {}).get("last_branch_result") or "").strip()
                         if branch_reason:
                             final_reason = branch_reason
-                    with _print_lock:
-                        print(
-                            f"[-] worker {worker_slot} run {run_id} failed after "
-                            f"{attempt} attempt(s)"
-                        )
+                        else:
+                            branch_page = str((_current_run_context() or {}).get("last_branch_page") or "").strip()
+                            pwd_page_type = str((_current_run_context() or {}).get("pwd_page_type") or "").strip()
+                            if branch_page == "create_account_password" and pwd_page_type:
+                                final_reason = f"stalled_at:{branch_page}:{pwd_page_type}"
+                            elif branch_page:
+                                final_reason = f"stalled_at:{branch_page}"
+                    if _hot_log_enabled():
+                        with _print_lock:
+                            print(
+                                f"[-] worker {worker_slot} run {run_id} failed after "
+                                f"{attempt} attempt(s)"
+                            )
                     return
 
                 retry_wait = random.uniform(0.8, 2.4)
-                with _print_lock:
-                    print(
-                        f"[Retry] worker {worker_slot} run {run_id} rerun "
-                        f"{attempt}/{effective_run_retries + 1}; "
-                        f"sleep {retry_wait:.1f}s before retry"
-                    )
+                if _hot_log_enabled():
+                    with _print_lock:
+                        print(
+                            f"[Retry] worker {worker_slot} run {run_id} rerun "
+                            f"{attempt}/{effective_run_retries + 1}; "
+                            f"sleep {retry_wait:.1f}s before retry"
+                        )
                 time.sleep(retry_wait)
         finally:
+            if final_status != "success":
+                _worker_backoff_set(worker_slot, final_reason)
+            _active_run_leave()
+            _maybe_refresh_email_domains()
             _record_experiment2_run_result(
                 status=final_status,
                 reason=final_reason,
                 token_saved=token_saved,
                 error=final_error,
             )
-            _emit_flow_summary(
-                worker_slot=worker_slot,
-                run_id=run_id,
-                status=final_status,
-                reason=final_reason,
-                elapsed_seconds=time.monotonic() - run_started_at,
-                error=final_error,
-            )
             _clear_run_context()
 
     run_count = 0
+    completed_run_count = 0
     _run_count_lock = threading.Lock()
+    _completed_run_count_lock = threading.Lock()
 
     def _next_run_id(worker_slot: int) -> str:
         nonlocal run_count
@@ -8209,31 +10047,44 @@ def main() -> None:
             run_count += 1
             return f"{_run_session_id}-w{worker_slot}-r{run_count}"
 
+    def _maybe_refresh_email_domains() -> None:
+        nonlocal completed_run_count
+        if MAIL_PROVIDER_MODE != "self_hosted_messages_api":
+            return
+        with _completed_run_count_lock:
+            completed_run_count += 1
+            current_completed = completed_run_count
+        if current_completed % 500 != 0:
+            return
+        print(f"[Info] refreshing email domains after {current_completed} completed runs")
+        fetch_email_domains(args.proxy)
+
     def _worker_loop(worker_slot: int) -> None:
         if args.once:
+            _wait_for_memory_window()
+            _wait_for_remote_file_limit_window()
             _one_run(worker_slot, _next_run_id(worker_slot))
             return
 
+        _initial_worker_jitter(worker_slot)
         while not _stop_event.is_set():
-            _one_run(worker_slot, _next_run_id(worker_slot))
+            backoff_wait = _worker_backoff_take(worker_slot)
+            if backoff_wait > 0:
+                time.sleep(min(backoff_wait, 30.0))
+            _wait_for_memory_window()
+            _wait_for_remote_file_limit_window()
+            with _active_run_slot():
+                _one_run(worker_slot, _next_run_id(worker_slot))
             if _stop_event.is_set():
                 return
             wait_time = random.randint(sleep_min, sleep_max)
-            with _print_lock:
-                print(f"[*] worker {worker_slot} sleep {wait_time} seconds...")
+            if _hot_log_enabled():
+                with _print_lock:
+                    print(f"[*] worker {worker_slot} sleep {wait_time} seconds...")
             time.sleep(wait_time)
 
     print(f"[Build] {SCRIPT_BUILD}")
     print(f"[Info] Yasal's Seamless OpenAI Auto-Registrar Started for ZJH (workers={workers})")
-    if auto_worker_cpu is not None:
-        print(
-            f"[Info] workers mode: auto "
-            f"(effective_cpu={auto_worker_cpu:.2f}, "
-            f"threads_per_hcpu={AUTO_WORKERS_PER_HCPU})"
-        )
-    else:
-        print("[Info] workers mode: manual")
-    print(f"[Info] cpa base url: {cpa_base_url}")
     print(
         f"[Info] stage limits: mailbox={mailbox_limit or 'unlimited'}, "
         f"otp={otp_limit or 'unlimited'}, register={register_limit or 'unlimited'}"
@@ -8245,7 +10096,15 @@ def main() -> None:
     else:
         print(
             "[Info] mailbox mode: "
-            + ("legacy (tempmail-first)" if _legacy_mail_mode else "default (dropmail-first)")
+            + (
+                "legacy (tempmail-first)"
+                if _legacy_mail_mode
+                else (
+                    "forced custom"
+                    if _custom_enabled
+                    else ("forced skymail" if _skymail_preferred else "default (dropmail-first)")
+                )
+            )
         )
         print(f"[Info] dropmail pool: {_dropmail_pool_mode}")
     if repair_result.get("moved_invalid"):
@@ -8255,9 +10114,17 @@ def main() -> None:
         )
     print(f"[Info] run retries per worker: {run_retries}")
     print(f"[Info] target tokens this run: {target_tokens or 'unlimited'}")
+    print(
+        f"[Info] remote file cap: "
+        f"{max_remote_files if max_remote_files > 0 else 'off'}"
+        + (
+            f" (check every {REMOTE_FILE_LIMIT_CHECK_INTERVAL_SECONDS}s)"
+            if max_remote_files > 0
+            else ""
+        )
+    )
     print(f"[Info] experiment: {'chatgpt' if _experiment_enabled else 'off'}")
     print(f"[Info] experiment2: {'managed' if _experiment2_enabled else 'off'}")
-    print(f"[Info] alpha: {'infini-submail' if _alpha_enabled else 'off'}")
     print(f"[Info] beta: {'cloudvxz-top2' if _beta_enabled else 'off'}")
     if _beta2_enabled:
         beta2_label = "cloudvxz-low-ek-si" if _low_mode else "cloudvxz-fresh2-winners"
@@ -8265,13 +10132,24 @@ def main() -> None:
         beta2_label = "off"
     print(f"[Info] beta2: {beta2_label}")
     if MAIL_PROVIDER_MODE != "self_hosted_messages_api":
+        print(f"[Info] custom: {'on' if _custom_enabled else 'off'}")
+        print(f"[Info] alpha: {'infini-submail' if _alpha_enabled else 'off'}")
         print(
             f"[Info] skymail: "
-            f"{'preferred' if _skymail_preferred else ('configured' if MAIL_SOURCES.get('skymail') else 'off')}"
+            f"{'forced' if _skymail_preferred else ('configured' if MAIL_SOURCES.get('skymail') else 'off')}"
         )
     print(f"[Info] browser mode: {'on' if _browser_mode else 'off'}")
     print(f"[Info] low mode: {'on' if _low_mode else 'off'}")
     print(f"[Info] no-blacklist: {'on' if _no_blacklist_mode else 'off'}")
+    print(
+        f"[Info] custom tuning: imap={'on' if CUSTOM_MAIL_IMAP_FALLBACK else 'off'} "
+        f"batch={'async' if _custom_batch_async_enabled() else 'sync'} "
+        f"http_limit={_resolve_custom_http_limit() or 'unlimited'} "
+        f"otp_wait_limit={_resolve_custom_otp_wait_limit() or 'unlimited'} "
+        f"run_limit={_resolve_active_run_limit() or 'unlimited'} "
+        f"signup_limit={_resolve_signup_http_limit() or 'unlimited'} "
+        f"otp_rounds={_custom_poll_rounds()}"
+    )
     print(f"[Info] run session: {_run_session_id}")
     if _experiment2_enabled and _experiment2_fresh_cloudvxz and _experiment2_fresh_pool:
         print(
@@ -8290,14 +10168,34 @@ def main() -> None:
         f"consent={SENTINEL_FLOW_CODEX_CONSENT}"
     )
 
-    if workers == 1:
-        _worker_loop(1)
-        return
+    try:
+        if workers == 1:
+            _worker_loop(1)
+            return
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_worker_loop, worker_slot) for worker_slot in range(1, workers + 1)]
-        for f in as_completed(futures):
-            f.result()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_worker_loop, worker_slot) for worker_slot in range(1, workers + 1)]
+            for f in as_completed(futures):
+                f.result()
+    finally:
+        remote_file_limit_stop_event.set()
+        _memory_manager_stop_event.set()
+        _custom_batch_dispatch_stop_event.set()
+        try:
+            memory_manager.join(timeout=2.0)
+        except Exception:
+            pass
+        if remote_file_limit_thread is not None:
+            try:
+                remote_file_limit_thread.join(timeout=2.0)
+            except Exception:
+                pass
+        if batch_dispatcher is not None:
+            try:
+                batch_dispatcher.join(timeout=2.0)
+            except Exception:
+                pass
+        globals().pop("_stop_event", None)
 
 
 if __name__ == "__main__":

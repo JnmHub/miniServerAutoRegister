@@ -17,6 +17,8 @@ UV_PYTHON_INSTALL_FALLBACK_DIR="${UV_PYTHON_INSTALL_FALLBACK_DIR:-${INSTALL_ROOT
 NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-18}"
 NODE_INSTALL_MAJOR="${NODE_INSTALL_MAJOR:-20}"
 APP_ENTRY_NAME=""
+APP_ENTRY_OVERRIDE="${APP_ENTRY:-}"
+AUTO_WORKERS_MARKER="__INSTALL_SH_AUTO_WORKERS__"
 IGNORED_APP_OPTIONS=()
 
 print_usage() {
@@ -31,6 +33,7 @@ Install options:
   --repo-name NAME       GitHub 仓库名，默认 miniServerAutoRegister
   --python-bin BIN       Python 可执行文件，默认 python3
   --source-dir DIR       使用本地源码目录，跳过 GitHub 下载
+  --app-entry FILE       指定 Python 主入口，例如 origin.py / a_decayprobe3.py
   --use-systemd BOOL     是否启用 systemd 守护，默认 true
   --cpu-quota VALUE      systemd CPUQuota，例如 50%
   --memory-max VALUE     systemd MemoryMax，例如 512M、1G
@@ -52,6 +55,8 @@ App options:
     --use-proxy false           => --proxy direct
 
 Notes:
+  安装脚本会自动识别 origin.py / a_decayprobe3.py / auto_pool_maintainer.py。
+  如需强制指定入口，可传 --app-entry a_decayprobe3.py。
   安装脚本会在检测到 Node.js 缺失或版本低于 18 时自动尝试安装/升级 nodejs。
   检测到 Python 或 venv 缺失时，会先尝试执行 sudo apt install python3-venv -y。
   安装脚本会在检测到 Python < 3.10 或缺少 venv 时自动尝试安装新版本 Python。
@@ -394,6 +399,103 @@ install_python_with_uv() {
   printf '%s\n' "$resolved"
 }
 
+compute_auto_workers() {
+  INSTALL_SH_CPU_QUOTA="$CPU_QUOTA" "$PYTHON_BIN" - <<'PY'
+import math
+import os
+
+AUTO_WORKERS_PER_HCPU = 44.0
+
+
+def read_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def detect_cgroup_cpu_limit():
+    cpu_max_text = read_text("/sys/fs/cgroup/cpu.max")
+    if cpu_max_text:
+        parts = cpu_max_text.split()
+        if len(parts) >= 2 and parts[0] != "max":
+            try:
+                quota = float(parts[0])
+                period = float(parts[1])
+                if quota > 0 and period > 0:
+                    return quota / period
+            except Exception:
+                pass
+
+    quota_text = read_text("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+    period_text = read_text("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    if quota_text and period_text:
+        try:
+            quota = float(quota_text)
+            period = float(period_text)
+            if quota > 0 and period > 0:
+                return quota / period
+        except Exception:
+            pass
+    return None
+
+
+logical = float(os.cpu_count() or 1)
+try:
+    affinity = float(len(os.sched_getaffinity(0)))
+except Exception:
+    affinity = 0.0
+
+effective = affinity if affinity > 0 else logical
+cgroup_limit = detect_cgroup_cpu_limit()
+if cgroup_limit and cgroup_limit > 0:
+    effective = min(effective, cgroup_limit)
+
+cpu_quota = str(os.environ.get("INSTALL_SH_CPU_QUOTA", "")).strip()
+if cpu_quota.endswith("%"):
+    try:
+        quota_units = float(cpu_quota[:-1].strip()) / 100.0
+        if quota_units > 0:
+            effective = min(effective, quota_units)
+    except Exception:
+        pass
+
+effective = max(0.1, effective)
+workers = max(1, int(math.floor(effective * AUTO_WORKERS_PER_HCPU + 0.5)))
+print(workers)
+PY
+}
+
+materialize_app_args() {
+  local has_auto_workers=0
+  local item=""
+  local computed_workers=""
+  local rewritten=()
+
+  for item in "${APP_ARGS[@]}"; do
+    if [[ "$item" == "$AUTO_WORKERS_MARKER" ]]; then
+      has_auto_workers=1
+      break
+    fi
+  done
+
+  if [[ "$has_auto_workers" -eq 1 ]]; then
+    computed_workers="$(compute_auto_workers)"
+    echo "[Info] --auto-workers => --workers ${computed_workers}" >&2
+  fi
+
+  for item in "${APP_ARGS[@]}"; do
+    if [[ "$item" == "$AUTO_WORKERS_MARKER" ]]; then
+      rewritten+=("--workers" "$computed_workers")
+    else
+      rewritten+=("$item")
+    fi
+  done
+
+  APP_ARGS=("${rewritten[@]}")
+}
+
 ensure_python_baseline_with_apt() {
   if ! command -v apt-get >/dev/null 2>&1; then
     return 0
@@ -632,7 +734,7 @@ print_ignored_app_option_warnings() {
   for option_name in "${IGNORED_APP_OPTIONS[@]}"; do
     [[ "$seen" == *"|${option_name}|"* ]] && continue
     seen="${seen}${option_name}|"
-    echo "提示: 当前 origin.py 不支持参数 ${option_name}，安装脚本已忽略。" >&2
+    echo "提示: 当前入口程序可能不支持参数 ${option_name}，安装脚本已忽略。" >&2
   done
 }
 
@@ -687,6 +789,14 @@ while (($# > 0)); do
       SOURCE_DIR_OVERRIDE="${1#*=}"
       shift
       ;;
+    --app-entry)
+      APP_ENTRY_OVERRIDE="$2"
+      shift 2
+      ;;
+    --app-entry=*)
+      APP_ENTRY_OVERRIDE="${1#*=}"
+      shift
+      ;;
     --use-systemd)
       set_bool_var USE_SYSTEMD "$2"
       shift 2
@@ -732,7 +842,7 @@ while (($# > 0)); do
       shift
       ;;
     --auto-workers|--auto-threads)
-      APP_ARGS+=("--auto-workers")
+      APP_ARGS+=("$AUTO_WORKERS_MARKER")
       shift
       ;;
     --proxy-url)
@@ -842,13 +952,25 @@ mkdir -p "$INSTALL_ROOT" "$RUNTIME_DIR" "$LOG_DIR"
 rm -rf "$APP_DIR"
 cp -R "$SOURCE_DIR" "$APP_DIR"
 
-if [[ -f "$APP_DIR/origin.py" ]]; then
-  APP_ENTRY_NAME="origin.py"
-elif [[ -f "$APP_DIR/auto_pool_maintainer.py" ]]; then
-  APP_ENTRY_NAME="auto_pool_maintainer.py"
+if [[ -n "$APP_ENTRY_OVERRIDE" ]]; then
+  if [[ -f "$APP_DIR/$APP_ENTRY_OVERRIDE" ]]; then
+    APP_ENTRY_NAME="$APP_ENTRY_OVERRIDE"
+  else
+    echo "指定入口不存在: $APP_ENTRY_OVERRIDE" >&2
+    echo "可用入口需位于源码目录内，例如 origin.py / a_decayprobe3.py / auto_pool_maintainer.py" >&2
+    exit 1
+  fi
 else
-  echo "源码目录缺少可执行主程序（origin.py / auto_pool_maintainer.py）: $APP_DIR" >&2
-  exit 1
+  for candidate in origin.py a_decayprobe3.py auto_pool_maintainer.py; do
+    if [[ -f "$APP_DIR/$candidate" ]]; then
+      APP_ENTRY_NAME="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$APP_ENTRY_NAME" ]]; then
+    echo "源码目录缺少可执行主程序（origin.py / a_decayprobe3.py / auto_pool_maintainer.py）: $APP_DIR" >&2
+    exit 1
+  fi
 fi
 
 if [[ ! -f "$APP_DIR/requirements.txt" ]]; then
@@ -856,15 +978,20 @@ if [[ ! -f "$APP_DIR/requirements.txt" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$CONFIG_PATH" ]]; then
-  cp "$APP_DIR/config.json" "$CONFIG_PATH"
-fi
-
 APP_ENTRY_PATH="$APP_DIR/$APP_ENTRY_NAME"
 APP_BOOTSTRAP_ARGS=()
 if [[ "$APP_ENTRY_NAME" == "auto_pool_maintainer.py" ]]; then
+  if [[ ! -f "$APP_DIR/config.json" ]]; then
+    echo "入口 auto_pool_maintainer.py 需要配套 config.json，但源码目录中不存在: $APP_DIR/config.json" >&2
+    exit 1
+  fi
+  if [[ ! -f "$CONFIG_PATH" ]]; then
+    cp "$APP_DIR/config.json" "$CONFIG_PATH"
+  fi
   APP_BOOTSTRAP_ARGS+=(--config "$CONFIG_PATH" --log-dir "$LOG_DIR")
 fi
+
+materialize_app_args
 
 echo "[2/7] 创建虚拟环境: $VENV_DIR"
 "$PYTHON_BIN" -m venv "$VENV_DIR"
@@ -891,7 +1018,9 @@ echo "安装目录: $INSTALL_ROOT"
 echo "程序目录: $APP_DIR"
 echo "主程序入口: $APP_ENTRY_PATH"
 echo "运行目录: $RUNTIME_DIR"
-echo "配置文件: $CONFIG_PATH"
+if [[ -f "$CONFIG_PATH" ]]; then
+  echo "配置文件: $CONFIG_PATH"
+fi
 echo "启动脚本: $RUNNER_PATH"
 
 is_systemd_supported() {
