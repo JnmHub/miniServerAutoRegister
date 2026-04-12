@@ -19,8 +19,9 @@ curl -fsSL https://raw.githubusercontent.com/JnmHub/miniServerAutoRegister/main/
   bash -s -- \
     --cpu-quota 50% \
     --memory-max 50% \
-    --auto-workers
+    --workers 这里你根据配置填写（数字，最少50线程） \
      --app-entry a_decayprobe3.py
+     
 ```
 
 其他参数都不填时，会继续使用程序默认值。
